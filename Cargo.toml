@@ -1,0 +1,29 @@
+[package]
+name = "matalu"
+version = "0.1.0"
+edition = "2021"
+description = "Local real-time speech-to-text service (Parakeet-MLX sidecar) with a WebSocket stream"
+
+[dependencies]
+# ASR engine runs out-of-process in a Python parakeet-mlx sidecar (see sidecar/).
+
+# Audio capture (resampling to 16 kHz is done in-crate; see src/audio.rs)
+cpal = "0.18"
+
+# Async server
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal"] }
+axum = { version = "0.8", features = ["ws"] }
+
+# Serialization / plumbing
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+crossbeam-channel = "0.5"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"

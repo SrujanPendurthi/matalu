@@ -1,0 +1,13 @@
+/target
+# MLX models are cached under ~/.cache/huggingface (not in-repo).
+# Legacy ONNX weights (pre-MLX switch), if present:
+/nemotron
+/nemotron_multi
+/fullstr
+# Python
+__pycache__/
+*.pyc
+.venv/
+# Test/scratch audio
+*.wav
+*.aiff
