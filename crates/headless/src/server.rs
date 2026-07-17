@@ -10,7 +10,7 @@ use axum::routing::get;
 use axum::Router;
 use tokio::sync::broadcast;
 
-use crate::events::TranscriptEvent;
+use matalu::events::TranscriptEvent;
 
 /// Live transcription viewer page, served at `/`.
 const INDEX_HTML: &str = include_str!("index.html");

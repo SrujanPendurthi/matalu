@@ -1,0 +1,31 @@
+[package]
+name = "matalu-app"
+description = "Matalu — system-wide dictation desktop app (Tauri shell around the matalu core pipeline)."
+version.workspace = true
+edition.workspace = true
+
+# Tauri wants a lib target (shared with mobile/main.rs); the binary is a thin wrapper.
+[lib]
+name = "matalu_app_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+matalu = { path = "../crates/core" }
+
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+
+# System-wide text injection: synthetic keys (CoreGraphics) + clipboard (arboard).
+arboard = "3"
+core-graphics = "0.25"
+
+tokio = { workspace = true, features = ["time"] }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tauri-plugin-global-shortcut = "2.3.2"

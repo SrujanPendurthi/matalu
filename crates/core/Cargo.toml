@@ -1,0 +1,25 @@
+[package]
+name = "matalu"
+description = "Core real-time speech-to-text pipeline: mic capture, resampling, and the parakeet-mlx sidecar."
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "matalu"
+path = "src/lib.rs"
+
+[dependencies]
+# Audio capture (resampling to 16 kHz is done in-crate; see src/audio.rs)
+cpal.workspace = true
+
+# Serialization / plumbing
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+
+# Transcript fan-out (broadcast channel) — consumers subscribe.
+tokio.workspace = true
+
+# Logging
+tracing.workspace = true

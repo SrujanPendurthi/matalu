@@ -9,7 +9,9 @@ use tracing_subscriber::EnvFilter;
 use matalu::config::{Config, TARGET_SAMPLE_RATE};
 use matalu::corrector::{Corrector, PassThrough};
 use matalu::events::TranscriptEvent;
-use matalu::{audio, server, sidecar};
+use matalu::{audio, sidecar};
+
+mod server;
 
 #[tokio::main]
 async fn main() -> Result<()> {

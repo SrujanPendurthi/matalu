@@ -1,0 +1,232 @@
+//! Dictation session state machine: turns hotkey presses into "listening"
+//! windows, gates whether real audio reaches the sidecar, and routes transcript
+//! events to the text injector.
+//!
+//! States:
+//! - **Idle**: the audio gate feeds *silence* to the sidecar (keeps it warm and
+//!   lets its VAD stay reset); transcript events are ignored — no typing.
+//! - **Listening**: real audio flows; partials type live, a VAD `final` commits
+//!   an utterance mid-session.
+//! - **Draining**: the user ended the session; we switch the gate back to
+//!   silence but keep routing to the injector briefly so the sidecar's trailing
+//!   `final` (flushed by the incoming silence) commits the last words. A
+//!   watchdog forces Idle if that `final` never arrives.
+//!
+//! Idle feeds *silence* rather than cutting the stream so we never send real
+//! speech to the model when the user isn't dictating (privacy), while the
+//! sidecar's existing silence-VAD segmentation keeps working unchanged.
+
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use matalu::events::TranscriptEvent;
+use tauri::{AppHandle, Emitter};
+
+use crate::injector::InjectorHandle;
+
+/// Tauri event carrying `{ "listening": bool }` for the UI status indicator.
+pub const STATUS_EVENT: &str = "status";
+
+/// How the hotkey drives sessions.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mode {
+    /// Hold to talk: press starts, release ends.
+    PushToTalk,
+    /// Tap to toggle listening on/off.
+    Toggle,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum State {
+    Idle,
+    Listening,
+    Draining,
+}
+
+pub struct Session {
+    state: Mutex<State>,
+    mode: Mutex<Mode>,
+    /// True once the sidecar is warm and mic capture is live. Activation before
+    /// this is ignored (the pipeline can't hear anything yet).
+    ready: Arc<AtomicBool>,
+    /// Read by the audio gate thread: true → forward real mic audio to the
+    /// sidecar; false → forward silence.
+    feed_real: Arc<AtomicBool>,
+    /// None when injection is disabled/unavailable (UI still updates).
+    injector: Option<InjectorHandle>,
+    app: AppHandle,
+    /// Last uncommitted partial text (for the drain watchdog fallback).
+    last_partial: Mutex<Option<String>>,
+    /// Invalidates stale drain watchdogs across rapid start/stop.
+    drain_gen: AtomicU64,
+    /// How long to wait in Draining for the trailing `final` before forcing Idle.
+    drain_timeout: Duration,
+}
+
+impl Session {
+    pub fn new(
+        app: AppHandle,
+        injector: Option<InjectorHandle>,
+        feed_real: Arc<AtomicBool>,
+        mode: Mode,
+        silence_ms: u64,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(State::Idle),
+            mode: Mutex::new(mode),
+            ready: Arc::new(AtomicBool::new(false)),
+            feed_real,
+            injector,
+            app,
+            last_partial: Mutex::new(None),
+            drain_gen: AtomicU64::new(0),
+            // Give the sidecar time to flush a trailing `final` after we start
+            // feeding silence (its VAD needs SILENCE_MS of quiet first).
+            drain_timeout: Duration::from_millis(silence_ms + 800),
+        })
+    }
+
+    pub fn set_mode(&self, mode: Mode) {
+        *self.mode.lock().unwrap() = mode;
+    }
+
+    /// Mark the pipeline ready (sidecar warm + mic capturing). Until this is
+    /// called, activation is ignored so the "listening" indicator can't lie.
+    pub fn mark_ready(&self) {
+        self.ready.store(true, Ordering::Relaxed);
+        let _ = self
+            .app
+            .emit(STATUS_EVENT, serde_json::json!({ "listening": false, "state": "ready" }));
+        tracing::info!("session: ready (mic live, model warm)");
+    }
+
+    // --- hotkey entry points -------------------------------------------------
+
+    /// Hotkey pressed.
+    pub fn on_press(self: &Arc<Self>) {
+        let mode = *self.mode.lock().unwrap();
+        match mode {
+            Mode::PushToTalk => self.start(),
+            Mode::Toggle => {
+                let listening = matches!(*self.state.lock().unwrap(), State::Listening);
+                if listening {
+                    self.stop();
+                } else {
+                    self.start();
+                }
+            }
+        }
+    }
+
+    /// Hotkey released (only meaningful for push-to-talk).
+    pub fn on_release(self: &Arc<Self>) {
+        if *self.mode.lock().unwrap() == Mode::PushToTalk {
+            self.stop();
+        }
+    }
+
+    // --- transitions ---------------------------------------------------------
+
+    fn start(self: &Arc<Self>) {
+        if !self.ready.load(Ordering::Relaxed) {
+            tracing::warn!("activation ignored: pipeline still warming up (model loading)");
+            let _ = self.app.emit(
+                STATUS_EVENT,
+                serde_json::json!({ "listening": false, "state": "warming" }),
+            );
+            return;
+        }
+        let mut st = self.state.lock().unwrap();
+        if *st == State::Listening {
+            return; // idempotent: ignore key-repeat / double-press
+        }
+        *st = State::Listening;
+        self.drain_gen.fetch_add(1, Ordering::Relaxed); // cancel any pending drain
+        *self.last_partial.lock().unwrap() = None;
+        if let Some(i) = &self.injector {
+            i.reset();
+        }
+        self.feed_real.store(true, Ordering::Relaxed);
+        drop(st);
+        self.emit_status(true);
+        tracing::info!("session: listening");
+    }
+
+    fn stop(self: &Arc<Self>) {
+        let mut st = self.state.lock().unwrap();
+        if *st != State::Listening {
+            return;
+        }
+        *st = State::Draining;
+        self.feed_real.store(false, Ordering::Relaxed); // sidecar now gets silence
+        let gen = self.drain_gen.fetch_add(1, Ordering::Relaxed) + 1;
+        drop(st);
+        self.emit_status(false);
+        tracing::info!("session: draining");
+        self.spawn_drain_watchdog(gen);
+    }
+
+    /// After `drain_timeout`, if still Draining under the same generation, commit
+    /// whatever partial we last saw and force Idle (the trailing `final` was lost).
+    fn spawn_drain_watchdog(self: &Arc<Self>, gen: u64) {
+        let me = Arc::clone(self);
+        let timeout = self.drain_timeout;
+        std::thread::spawn(move || {
+            std::thread::sleep(timeout);
+            let mut st = me.state.lock().unwrap();
+            if *st != State::Draining || me.drain_gen.load(Ordering::Relaxed) != gen {
+                return; // superseded by a newer session, or already finished
+            }
+            *st = State::Idle;
+            drop(st);
+            if let Some(i) = &me.injector {
+                if let Some(text) = me.last_partial.lock().unwrap().take() {
+                    i.commit(text);
+                } else {
+                    i.reset();
+                }
+            }
+            me.emit_status(false);
+            tracing::info!("session: drain watchdog forced idle");
+        });
+    }
+
+    // --- transcript routing --------------------------------------------------
+
+    /// Feed a transcript event through the session. No-op while Idle.
+    pub fn on_event(&self, ev: &TranscriptEvent) {
+        let mut st = self.state.lock().unwrap();
+        if *st == State::Idle {
+            return;
+        }
+        match ev {
+            TranscriptEvent::Partial { text, .. } => {
+                if let Some(i) = &self.injector {
+                    i.partial(text.clone());
+                }
+                *self.last_partial.lock().unwrap() = Some(text.clone());
+            }
+            TranscriptEvent::Final { text, .. } => {
+                if let Some(i) = &self.injector {
+                    i.commit(text.clone());
+                }
+                *self.last_partial.lock().unwrap() = None;
+                if *st == State::Draining {
+                    *st = State::Idle;
+                    self.drain_gen.fetch_add(1, Ordering::Relaxed);
+                    drop(st);
+                    self.emit_status(false);
+                    tracing::info!("session: idle (trailing final committed)");
+                }
+                // In Listening, a VAD final just segments an utterance; stay on.
+            }
+        }
+    }
+
+    fn emit_status(&self, listening: bool) {
+        let _ = self
+            .app
+            .emit(STATUS_EVENT, serde_json::json!({ "listening": listening }));
+    }
+}

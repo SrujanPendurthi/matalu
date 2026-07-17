@@ -1,0 +1,20 @@
+[package]
+name = "matalu-headless"
+description = "Headless WebSocket transcription service (dev/debug harness for the matalu core pipeline)."
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "matalu-headless"
+path = "src/main.rs"
+
+[dependencies]
+matalu = { path = "../core" }
+
+tokio.workspace = true
+axum.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
