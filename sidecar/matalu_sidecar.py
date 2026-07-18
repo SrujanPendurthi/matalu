@@ -21,7 +21,32 @@ import mlx.core as mx
 from parakeet_mlx import from_pretrained
 
 SR = 16000
-MODEL_ID = os.environ.get("MATALU_MLX_MODEL", "mlx-community/parakeet-tdt-0.6b-v2")
+
+# Model source resolution prefers a local/bundled copy over the Hub, so a normal
+# run never touches the network. A parakeet-mlx model dir is just a folder with
+# `config.json` + the `*.safetensors` weights; `from_pretrained` accepts either
+# such a path or a Hub repo ID.
+REPO_ID = "mlx-community/parakeet-tdt-0.6b-v2"
+_SIDECAR_DIR = os.path.dirname(os.path.abspath(__file__))
+_BUNDLED_DIR = os.path.join(_SIDECAR_DIR, "models", "parakeet-tdt-0.6b-v2")
+
+
+def resolve_model() -> str:
+    """Pick the model source, preferring a local/bundled dir over the Hub.
+
+    Priority:
+      1. MATALU_MLX_MODEL — explicit override (a local path or a Hub repo ID).
+      2. A bundled model dir next to the sidecar (fully offline; the norm).
+      3. The Hub repo ID — downloads + caches on first run (the fallback).
+    """
+    override = os.environ.get("MATALU_MLX_MODEL")
+    if override:
+        return override
+    if os.path.isdir(_BUNDLED_DIR):
+        return _BUNDLED_DIR
+    return REPO_ID
+
+
 SILENCE_MS = int(os.environ.get("MATALU_SILENCE_MS", "700"))
 VAD_RMS = float(os.environ.get("MATALU_VAD_RMS", "0.010"))
 CHUNK = SR // 2  # 0.5 s processing granularity
@@ -45,8 +70,10 @@ def emit(kind: str, text: str, ts_ms: int) -> None:
 
 
 def main() -> None:
-    log(f"loading {MODEL_ID} ...")
-    model = from_pretrained(MODEL_ID)
+    model_src = resolve_model()
+    kind = "local dir" if os.path.isdir(model_src) else "Hub repo"
+    log(f"loading {model_src} ({kind}) ...")
+    model = from_pretrained(model_src)
     if model.preprocessor_config.sample_rate != SR:
         log(f"WARNING: model sample_rate={model.preprocessor_config.sample_rate}, expected {SR}")
 
