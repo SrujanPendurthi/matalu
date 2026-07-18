@@ -28,6 +28,8 @@ python3 sidecar/test_stream.py some_audio_16k.wav # sidecar streaming smoke test
 
 Python deps for the sidecar: `python3 -m pip install parakeet-mlx` (pulls in mlx; a venv is recommended). The MLX model (~1.2 GB) downloads and caches automatically on first sidecar run. Grant microphone permission on first real run. The desktop app additionally needs **Accessibility** permission (for text injection). Default sidecar path (`sidecar/matalu_sidecar.py`) is relative to CWD, so run from the workspace root in dev.
 
+In `cargo tauri dev` the `main` transcript window no longer appears — it launches hidden. The visible surfaces are the **menu-bar tray** (Settings…, Show/Hide, Quit) and the floating **pill** (shown only while dictating); reveal the transcript window via the tray's "Show / Hide Window".
+
 ## Architecture
 
 The **core pipeline** (`crates/core/`) flows one direction through stages, each in its own thread/process so a stall in one never blocks the others, terminating in a `tokio::broadcast` of `TranscriptEvent`s that a frontend consumes:
@@ -51,7 +53,7 @@ cpal mic (48 kHz) → resample→16k mono → Python parakeet-mlx sidecar → br
   - `injector.rs` — system-wide text injection: diff-based live partials (unit-tested `DiffState`) pasted via clipboard (`arboard`) + **CoreGraphics `CGEvent`** keystrokes. Do **not** use enigo here (see [[matalu-injection-coregraphics]]).
   - `hotkey.rs` — global activation via `tauri-plugin-global-shortcut` (Pressed/Released → push-to-talk or toggle).
   - `settings.rs` + `commands.rs` — persisted `Settings` (activation mode + hotkey preset) as JSON in the app config dir; Tauri commands for the settings window (`ui/settings.html`) and Accessibility onboarding.
-  - `tray.rs` — menu-bar tray (Settings…, Show/Hide, Quit). Frontend is static HTML/JS in `ui/` (no bundler; `withGlobalTauri` exposes `window.__TAURI__`).
+  - `tray.rs` — menu-bar tray (Settings…, Show/Hide, Quit). Frontend is static HTML/JS in `ui/` (no bundler; `withGlobalTauri` exposes `window.__TAURI__`). **Adding a window = declaring it in `tauri.conf.json` with a `url` pointing at a `ui/*.html` file** — Tauri serves those directly, so there's no build step and nothing to import; the files are plain HTML/JS.
   - **Menu-bar-only presence:** `lib.rs::run()` sets `ActivationPolicy::Accessory` (no dock icon), and the `main` transcript window is **hidden on launch** (dev-only; reveal via tray "Show / Hide Window"). The signature surface is a floating **pill** — a transparent, always-on-top, non-activating (`focus:false` + `set_ignore_cursor_events`) window (`ui/pill.html`, needs `macos-private-api`), parked bottom-center by `lib.rs::setup_pill`. `session.rs::set_pill` shows it for the whole dictation window (Listening + Draining) and hides it on return to Idle; it mirrors the same app-wide `transcript`/`status` emits the main window uses.
 
 ## Key conventions & decisions
