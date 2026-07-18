@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use matalu::events::TranscriptEvent;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::injector::InjectorHandle;
 
@@ -150,6 +150,7 @@ impl Session {
         self.feed_real.store(true, Ordering::Relaxed);
         drop(st);
         self.emit_status(true);
+        self.set_pill(true);
         tracing::info!("session: listening");
     }
 
@@ -188,6 +189,7 @@ impl Session {
                 }
             }
             me.emit_status(false);
+            me.set_pill(false);
             tracing::info!("session: drain watchdog forced idle");
         });
     }
@@ -217,6 +219,7 @@ impl Session {
                     self.drain_gen.fetch_add(1, Ordering::Relaxed);
                     drop(st);
                     self.emit_status(false);
+                    self.set_pill(false);
                     tracing::info!("session: idle (trailing final committed)");
                 }
                 // In Listening, a VAD final just segments an utterance; stay on.
@@ -228,5 +231,13 @@ impl Session {
         let _ = self
             .app
             .emit(STATUS_EVENT, serde_json::json!({ "listening": listening }));
+    }
+
+    /// Show/hide the floating pill overlay. Visible for the whole dictation
+    /// window (Listening + Draining); hidden once we return to Idle.
+    fn set_pill(&self, visible: bool) {
+        if let Some(win) = self.app.get_webview_window("pill") {
+            let _ = if visible { win.show() } else { win.hide() };
+        }
     }
 }

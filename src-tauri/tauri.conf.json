@@ -8,6 +8,7 @@
   },
   "app": {
     "withGlobalTauri": true,
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "main",
@@ -15,7 +16,7 @@
         "width": 440,
         "height": 600,
         "resizable": true,
-        "visible": true
+        "visible": false
       },
       {
         "label": "settings",
@@ -24,6 +25,21 @@
         "width": 440,
         "height": 560,
         "resizable": true,
+        "visible": false
+      },
+      {
+        "label": "pill",
+        "title": "Matalu",
+        "url": "pill.html",
+        "width": 260,
+        "height": 52,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "focus": false,
         "visible": false
       }
     ],

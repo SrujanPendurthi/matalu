@@ -15,7 +15,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 matalu = { path = "../crates/core" }
 
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# macos-private-api: transparent (rounded) pill window. tray-icon: menu-bar presence.
+tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
 
 # System-wide text injection: synthetic keys (CoreGraphics) + clipboard (arboard).
 arboard = "3"

@@ -13,7 +13,7 @@ mod session;
 mod settings;
 mod tray;
 
-use tauri::Manager;
+use tauri::{LogicalPosition, Manager};
 
 use crate::session::Mode;
 
@@ -43,6 +43,16 @@ pub fn run() {
             commands::show_settings_window,
         ])
         .setup(|app| {
+            // Menu-bar-only: no dock icon, no app window in ⌘-Tab. The UI lives
+            // in the tray; the transcript window is dev-only (Show via tray).
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+            // The floating pill is display-only: click-through so it never steals
+            // clicks (or focus) from the app being dictated into, parked at the
+            // bottom-center of the primary screen.
+            setup_pill(app.handle());
+
             let handle = app.handle().clone();
 
             // Persisted settings drive activation mode + hotkey. MATALU_MODE
@@ -69,4 +79,32 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running matalu");
+}
+
+/// Make the pill click-through and park it at the bottom-center of the primary
+/// monitor. Best-effort: if the window or monitor info isn't available we leave
+/// the pill at its configured default position.
+fn setup_pill(app: &tauri::AppHandle) {
+    let Some(pill) = app.get_webview_window("pill") else {
+        tracing::warn!("pill window not found; skipping placement");
+        return;
+    };
+    // Display-only overlay: pass clicks through to whatever is behind it.
+    let _ = pill.set_ignore_cursor_events(true);
+
+    // Bottom-center of the primary monitor (logical coords avoid scale math).
+    match pill.primary_monitor() {
+        Ok(Some(monitor)) => {
+            let scale = monitor.scale_factor();
+            let m_size = monitor.size().to_logical::<f64>(scale);
+            let m_pos = monitor.position().to_logical::<f64>(scale);
+            const PILL_W: f64 = 260.0;
+            const PILL_H: f64 = 52.0;
+            const BOTTOM_GAP: f64 = 96.0;
+            let x = m_pos.x + (m_size.width - PILL_W) / 2.0;
+            let y = m_pos.y + m_size.height - PILL_H - BOTTOM_GAP;
+            let _ = pill.set_position(LogicalPosition::new(x, y));
+        }
+        _ => tracing::warn!("no primary monitor; leaving pill at default position"),
+    }
 }
