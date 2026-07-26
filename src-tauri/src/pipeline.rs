@@ -4,8 +4,11 @@
 //! The gate sits between capture and the sidecar so the [`Session`] can decide,
 //! per buffer, whether the model hears real audio (listening) or silence (idle).
 
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
+use std::fs::File;
+use std::io::BufWriter;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use matalu::config::{Config, TARGET_SAMPLE_RATE};
@@ -34,6 +37,70 @@ pub mod gate {
     pub const SILENCE: u8 = 1;
     /// Listening: forward real mic audio.
     pub const REAL: u8 = 2;
+}
+
+/// Records the merged 16 kHz mono meeting audio to a WAV for post-hoc
+/// diarization, and tracks meeting-relative elapsed samples. Shared between the
+/// audio-gate thread (writes) and the [`Session`] (start/stop + elapsed time).
+pub struct MeetingRecorder {
+    writer: Mutex<Option<hound::WavWriter<BufWriter<File>>>>,
+    path: Mutex<Option<std::path::PathBuf>>,
+    samples: AtomicU64,
+}
+
+impl MeetingRecorder {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            writer: Mutex::new(None),
+            path: Mutex::new(None),
+            samples: AtomicU64::new(0),
+        })
+    }
+
+    /// Begin recording to `path` (overwrites); resets the sample counter.
+    pub fn start(&self, path: &Path) -> anyhow::Result<()> {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: TARGET_SAMPLE_RATE,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let writer = hound::WavWriter::create(path, spec)?;
+        self.samples.store(0, Ordering::Relaxed);
+        *self.path.lock().unwrap() = Some(path.to_path_buf());
+        *self.writer.lock().unwrap() = Some(writer);
+        Ok(())
+    }
+
+    /// Append mono f32 samples (called from the gate thread on `REAL` audio).
+    /// No-op unless recording.
+    ///
+    /// ponytail: this does buffered file I/O on the gate thread — cheap via
+    /// `BufWriter`; a disk stall would slow forwarding, which the lossy sidecar
+    /// channel absorbs. Fine for personal meeting capture; move to a dedicated
+    /// writer thread if it ever bites.
+    pub fn write(&self, buf: &[f32]) {
+        let mut guard = self.writer.lock().unwrap();
+        if let Some(w) = guard.as_mut() {
+            for &s in buf {
+                let _ = w.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16);
+            }
+            self.samples.fetch_add(buf.len() as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Finalize the WAV and stop recording; returns the written path (if any).
+    pub fn stop(&self) -> Option<std::path::PathBuf> {
+        if let Some(w) = self.writer.lock().unwrap().take() {
+            let _ = w.finalize();
+        }
+        self.path.lock().unwrap().take()
+    }
+
+    /// Meeting-relative elapsed milliseconds (from samples recorded so far).
+    pub fn elapsed_ms(&self) -> u64 {
+        self.samples.load(Ordering::Relaxed) * 1000 / TARGET_SAMPLE_RATE as u64
+    }
 }
 
 /// What [`start`] hands back to the app: the session (also placed in managed
@@ -88,7 +155,15 @@ pub fn start(app: AppHandle, mode: Mode) -> anyhow::Result<Started> {
     // Session owns the listening state and the audio gate mode (starts Idle =
     // feed nothing, so the sidecar idles until the first dictation).
     let gate_mode = Arc::new(AtomicU8::new(gate::NONE));
-    let session = Session::new(app.clone(), inject, gate_mode.clone(), mode, silence_ms);
+    let recorder = MeetingRecorder::new();
+    let session = Session::new(
+        app.clone(),
+        inject,
+        gate_mode.clone(),
+        recorder.clone(),
+        mode,
+        silence_ms,
+    );
 
     // Transcript fan-out: one producer, consumers = the forwarder.
     let (events_tx, events_rx) = broadcast::channel::<TranscriptEvent>(256);
@@ -106,7 +181,7 @@ pub fn start(app: AppHandle, mode: Mode) -> anyhow::Result<Started> {
     // capture --(gate)--> sidecar. Both legs bounded + lossy (drop, never block).
     let (capture_tx, capture_rx) = crossbeam_channel::bounded::<Vec<f32>>(64);
     let (sidecar_tx, sidecar_rx) = crossbeam_channel::bounded::<Vec<f32>>(64);
-    spawn_audio_gate(capture_rx, sidecar_tx, gate_mode);
+    spawn_audio_gate(capture_rx, sidecar_tx, gate_mode, recorder);
 
     let corrector = Arc::new(PassThrough);
     let sc = sidecar::spawn(cfg, sidecar_rx, events_tx, corrector)?;
@@ -153,6 +228,7 @@ fn spawn_audio_gate(
     capture_rx: crossbeam_channel::Receiver<Vec<f32>>,
     sidecar_tx: crossbeam_channel::Sender<Vec<f32>>,
     gate_mode: Arc<AtomicU8>,
+    recorder: Arc<MeetingRecorder>,
 ) {
     std::thread::Builder::new()
         .name("audio-gate".into())
@@ -186,6 +262,9 @@ fn spawn_audio_gate(
                             real_samples = 0;
                             peak = 0.0;
                         }
+                        // Persist meeting audio for post-hoc diarization (no-op
+                        // unless a meeting is recording).
+                        recorder.write(&buf);
                         buf
                     }
                     gate::SILENCE => vec![0.0f32; buf.len()], // silence, same cadence

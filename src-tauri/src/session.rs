@@ -18,13 +18,14 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use matalu::events::TranscriptEvent;
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::diarize::{self, Line};
 use crate::injector::InjectorHandle;
-use crate::pipeline::gate;
+use crate::pipeline::{gate, MeetingRecorder};
 
 /// Tauri event carrying `{ "listening": bool }` for the UI status indicator.
 pub const STATUS_EVENT: &str = "status";
@@ -54,6 +55,11 @@ pub struct Session {
     /// Meeting-transcript mode: capture runs continuously, transcripts fill the
     /// window but are **not** injected, and the dictation hotkey is ignored.
     meeting: AtomicBool,
+    /// Records the meeting audio to a WAV and tracks meeting-relative time, for
+    /// post-hoc diarization on stop.
+    recorder: Arc<MeetingRecorder>,
+    /// Committed meeting lines with timing, accumulated while `meeting`.
+    meeting_lines: Mutex<Vec<Line>>,
     /// Read by the audio gate thread; one of [`gate::NONE`]/[`gate::SILENCE`]/
     /// [`gate::REAL`]. Drives what the sidecar hears per dictation phase.
     gate: Arc<AtomicU8>,
@@ -73,6 +79,7 @@ impl Session {
         app: AppHandle,
         injector: Option<InjectorHandle>,
         gate: Arc<AtomicU8>,
+        recorder: Arc<MeetingRecorder>,
         mode: Mode,
         silence_ms: u64,
     ) -> Arc<Self> {
@@ -81,6 +88,8 @@ impl Session {
             mode: Mutex::new(mode),
             ready: Arc::new(AtomicBool::new(false)),
             meeting: AtomicBool::new(false),
+            recorder,
+            meeting_lines: Mutex::new(Vec::new()),
             gate,
             injector,
             app,
@@ -126,6 +135,14 @@ impl Session {
         }
         self.meeting.store(true, Ordering::Relaxed);
         *self.state.lock().unwrap() = State::Listening;
+        self.meeting_lines.lock().unwrap().clear();
+        // Record the meeting audio for post-hoc diarization (best-effort — if
+        // recording can't start, the meeting still transcribes, just unlabeled).
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let wav = std::env::temp_dir().join(format!("matalu-meeting-{ts}.wav"));
+        if let Err(e) = self.recorder.start(&wav) {
+            tracing::warn!(error = %e, "failed to start meeting recorder; transcript will be unlabeled");
+        }
         self.gate.store(gate::REAL, Ordering::Relaxed);
         if let Some(win) = self.app.get_webview_window("main") {
             let _ = win.show();
@@ -137,16 +154,25 @@ impl Session {
         tracing::info!("session: meeting transcript started");
     }
 
-    /// Stop meeting transcription: idle the capture and hide the window.
+    /// Stop meeting transcription: idle the capture, keep the window up, and
+    /// kick off post-hoc diarization on a background thread (loads models,
+    /// takes seconds) which emits the labeled transcript when done.
     pub fn stop_meeting(self: &Arc<Self>) {
         self.meeting.store(false, Ordering::Relaxed);
         *self.state.lock().unwrap() = State::Idle;
         self.gate.store(gate::NONE, Ordering::Relaxed);
-        if let Some(win) = self.app.get_webview_window("main") {
-            let _ = win.hide();
-        }
         self.emit_status(false);
         tracing::info!("session: meeting transcript stopped");
+
+        let wav = self.recorder.stop();
+        let lines = std::mem::take(&mut *self.meeting_lines.lock().unwrap());
+        match wav {
+            Some(wav) if !lines.is_empty() => {
+                let app = self.app.clone();
+                std::thread::spawn(move || diarize::run(app, wav, lines));
+            }
+            _ => tracing::info!("no meeting audio/lines to diarize"),
+        }
     }
 
     // --- hotkey entry points -------------------------------------------------
@@ -254,8 +280,15 @@ impl Session {
     /// Feed a transcript event through the session. No-op while Idle.
     pub fn on_event(&self, ev: &TranscriptEvent) {
         if self.meeting.load(Ordering::Relaxed) {
-            // Meeting mode: the UI receives every event via pipeline::forward();
-            // don't inject keystrokes or run the dictation state machine.
+            // Meeting mode: the UI receives every event via pipeline::forward()
+            // (no injection). Record each committed line with its meeting-relative
+            // time span so post-hoc diarization can label it by speaker.
+            if let TranscriptEvent::Final { text, .. } = ev {
+                let end_ms = self.recorder.elapsed_ms();
+                let mut lines = self.meeting_lines.lock().unwrap();
+                let start_ms = lines.last().map(|l| l.end_ms).unwrap_or(0);
+                lines.push(Line { start_ms, end_ms, text: text.clone() });
+            }
             return;
         }
         let mut st = self.state.lock().unwrap();

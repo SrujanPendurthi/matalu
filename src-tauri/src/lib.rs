@@ -6,6 +6,7 @@
 //! text injection, activated by a global hotkey.
 
 mod commands;
+mod diarize;
 mod fnkey;
 mod hotkey;
 mod injector;

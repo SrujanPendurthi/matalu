@@ -54,6 +54,12 @@ VAD_RMS = float(os.environ.get("MATALU_VAD_RMS", "0.010"))
 # overlapping speakers) can run for minutes with no 700 ms gap, which would
 # otherwise grow one endless partial and let the streaming context balloon.
 MAX_UTTERANCE_MS = int(os.environ.get("MATALU_MAX_UTTERANCE_MS", "12000"))
+# Reset the streaming context after this much *continuous idle silence* (no
+# active utterance). In meeting mode the gate feeds real audio non-stop, so we
+# keep calling add_audio through quiet stretches; without this the context (and
+# MLX memory) grows unbounded on silence, since a `final` — which is what resets
+# it — only fires after speech. Bounds the silence pre-roll the context holds.
+IDLE_RESET_MS = int(os.environ.get("MATALU_IDLE_RESET_MS", "3000"))
 CHUNK = SR // 2  # 0.5 s processing granularity
 
 # Streaming attention context (left, right) in encoder frames. This is the main
@@ -74,6 +80,15 @@ def log(msg: str) -> None:
 def emit(kind: str, text: str, ts_ms: int) -> None:
     sys.stdout.write(json.dumps({"type": kind, "text": text, "ts_ms": ts_ms}) + "\n")
     sys.stdout.flush()
+
+
+def new_stream(model):
+    """Open a fresh streaming context and return (ctx, tx). Callers exit the old
+    ctx first. Also release MLX's pooled buffers so the reset actually frees
+    memory (weights stay resident; macOS can't reclaim the pool itself)."""
+    mx.clear_cache()
+    ctx = model.transcribe_stream(context_size=CONTEXT_SIZE)
+    return ctx, ctx.__enter__()
 
 
 def main() -> None:
@@ -114,10 +129,10 @@ def main() -> None:
     processed = 0        # total samples consumed (for timestamps)
     silence_ms = 0
     utterance_ms = 0     # continuous-speech duration since the last final
+    idle_ms = 0          # continuous idle-silence duration (no active utterance)
     in_utterance = False
 
-    ctx = model.transcribe_stream(context_size=CONTEXT_SIZE)
-    tx = ctx.__enter__()
+    ctx, tx = new_stream(model)
 
     try:
         while True:
@@ -144,6 +159,7 @@ def main() -> None:
             if rms > VAD_RMS:
                 in_utterance = True
                 silence_ms = 0
+                idle_ms = 0
                 utterance_ms += step_ms
             elif in_utterance:
                 silence_ms += step_ms
@@ -154,23 +170,24 @@ def main() -> None:
                 # Commit + reset on a silence gap (utterance ended) OR the
                 # max-utterance cap (long continuous speech that never pauses,
                 # e.g. a meeting monologue) so the transcript keeps flowing and
-                # the streaming context stays bounded.
+                # the streaming context stays bounded. new_stream() also clears
+                # MLX's pooled buffers so the reset frees memory.
                 if silence_ms >= SILENCE_MS or utterance_ms >= MAX_UTTERANCE_MS:
                     emit("final", tx.result.text, ts_ms)
-                    # Reset streaming state for the next utterance.
                     ctx.__exit__(None, None, None)
-                    ctx = model.transcribe_stream(context_size=CONTEXT_SIZE)
-                    tx = ctx.__enter__()
+                    ctx, tx = new_stream(model)
                     in_utterance = False
                     silence_ms = 0
                     utterance_ms = 0
-                    # Release MLX's pooled scratch/activation buffers. Weights
-                    # stay resident → the next utterance is still instant; macOS
-                    # can't reclaim this pool itself (MLX holds live refs).
-                    # ponytail: in meeting mode this fires on every capped final
-                    # (~12 s) — a cheap realloc churn, not a model reload; tighten
-                    # only if it measurably hurts.
-                    mx.clear_cache()
+            else:
+                # Idle silence with no active utterance. We keep feeding real
+                # audio (meeting mode never gates to NONE), so periodically drop
+                # the accumulated silence context to keep MLX memory bounded.
+                idle_ms += step_ms
+                if idle_ms >= IDLE_RESET_MS:
+                    ctx.__exit__(None, None, None)
+                    ctx, tx = new_stream(model)
+                    idle_ms = 0
     finally:
         try:
             ctx.__exit__(None, None, None)

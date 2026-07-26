@@ -22,6 +22,8 @@
          border: 1px solid #2c303b; border-radius: 6px; padding: 4px 10px; cursor: pointer; }
   .btn:hover { background: #232733; }
   .btn:active { background: #2c313f; }
+  .spk { padding: 1px 7px; margin-right: 4px; font-size: 12px; color: #9db4ff;
+         border-color: #34406b; vertical-align: baseline; }
   #dot { width: 9px; height: 9px; border-radius: 50%; background: #d15b5b; }
   #dot.on { background: #4caf72; }
   main { flex: 1; overflow-y: auto; padding: 20px; }
@@ -58,6 +60,13 @@
     const footer = document.getElementById('footer');
     let hint = document.getElementById('hint');
     const finals = [];  // committed transcript lines, for Save
+    let labeled = null;         // diarized [{speaker, text}] after a meeting stops
+    const speakerNames = {};    // speaker id → user-renamed label
+
+    function nameFor(id) {
+      if (id < 0) return 'Speaker ?';
+      return speakerNames[id] || ('Speaker ' + (id + 1));
+    }
 
     function onEvent(m) {
       if (hint) { hint.remove(); hint = null; }
@@ -77,10 +86,40 @@
       }
     }
 
+    // Render the diarized transcript: one line per utterance, prefixed by a
+    // clickable speaker label the user can rename (remaps every line for that id).
+    function renderMeeting() {
+      if (hint) { hint.remove(); hint = null; }
+      log.innerHTML = '';
+      for (const l of labeled) {
+        const p = document.createElement('p');
+        p.className = 'line final';
+        const tag = document.createElement('button');
+        tag.className = 'btn spk';
+        tag.textContent = nameFor(l.speaker);
+        tag.title = 'Click to rename this speaker';
+        tag.addEventListener('click', () => {
+          if (l.speaker < 0) return;
+          const name = window.prompt('Name for ' + nameFor(l.speaker) + ':', nameFor(l.speaker));
+          if (name) { speakerNames[l.speaker] = name; renderMeeting(); }
+        });
+        p.append(tag, document.createTextNode(' ' + l.text));
+        log.append(p);
+      }
+      log.scrollTop = log.scrollHeight;
+      footer.textContent = 'Diarized transcript — click a speaker to rename.';
+    }
+
+    function transcriptText() {
+      if (labeled) return labeled.map(l => nameFor(l.speaker) + ': ' + l.text).join('\n');
+      return finals.join('\n');
+    }
+
     async function saveTranscript() {
-      if (!finals.length) { footer.textContent = 'Nothing to save yet.'; return; }
+      const text = transcriptText();
+      if (!text) { footer.textContent = 'Nothing to save yet.'; return; }
       try {
-        const path = await window.__TAURI__.core.invoke('save_transcript', { text: finals.join('\n') });
+        const path = await window.__TAURI__.core.invoke('save_transcript', { text });
         footer.textContent = 'Saved: ' + path;
       } catch (e) {
         footer.textContent = 'Save failed: ' + e;
@@ -89,6 +128,7 @@
 
     function clearTranscript() {
       finals.length = 0;
+      labeled = null;
       log.innerHTML = '';
       partialEl.innerHTML = '';
       footer.textContent = 'Cleared.';
@@ -127,6 +167,7 @@
       const { listen } = window.__TAURI__.event;
       await listen('transcript', (e) => onEvent(e.payload));
       await listen('status', (e) => onStatus(e.payload));
+      await listen('meeting_result', (e) => { labeled = e.payload || []; renderMeeting(); });
       statustext.textContent = 'warming up — loading model…';
     }
     start();

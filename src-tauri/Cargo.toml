@@ -24,6 +24,9 @@ core-graphics = "0.25"
 # fn-key (Globe) global hold via a CGEventTap driven on its own CFRunLoop.
 core-foundation = "0.10"
 
+# Meeting-audio recording → WAV for post-hoc diarization.
+hound = "3"
+
 tokio = { workspace = true, features = ["time"] }
 serde.workspace = true
 serde_json.workspace = true
