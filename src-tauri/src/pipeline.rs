@@ -4,7 +4,7 @@
 //! The gate sits between capture and the sidecar so the [`Session`] can decide,
 //! per buffer, whether the model hears real audio (listening) or silence (idle).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,6 +21,21 @@ use crate::session::{Mode, Session};
 /// Tauri event name carrying a serialized [`TranscriptEvent`] to the UI.
 pub const TRANSCRIPT_EVENT: &str = "transcript";
 
+/// Audio-gate modes shared between the [`Session`] and the gate thread. The
+/// session writes; the gate reads (`Relaxed` — a one-buffer lag is harmless).
+///
+/// This is the "explicit start/stop" mechanism: rather than feeding the sidecar
+/// silence forever, [`NONE`] feeds it *nothing*, so its blocking `stdin.read`
+/// parks and it stops running inference on silence between dictations.
+pub mod gate {
+    /// Idle: forward nothing — the sidecar blocks on stdin and idles (no inference).
+    pub const NONE: u8 = 0;
+    /// Draining: forward silence so the sidecar's VAD flushes the trailing `final`.
+    pub const SILENCE: u8 = 1;
+    /// Listening: forward real mic audio.
+    pub const REAL: u8 = 2;
+}
+
 /// What [`start`] hands back to the app: the session (also placed in managed
 /// state so the hotkey handler can reach it) and the sidecar child to keep alive.
 pub struct Started {
@@ -31,7 +46,15 @@ pub struct Started {
 /// Start the pipeline and return the [`Session`] + sidecar child. `mode` is the
 /// initial activation mode (from persisted settings / env override).
 pub fn start(app: AppHandle, mode: Mode) -> anyhow::Result<Started> {
-    let cfg = Config::from_env()?;
+    let mut cfg = Config::from_env()?;
+    // Prefer a bundled sidecar binary shipped next to the app executable
+    // (packaged build) unless the dev env vars pin python/script explicitly.
+    if cfg.sidecar_bin.is_none() && std::env::var_os("MATALU_SIDECAR").is_none() {
+        if let Some(bundled) = bundled_sidecar_path() {
+            tracing::info!(path = %bundled.display(), "using bundled sidecar binary");
+            cfg.sidecar_bin = Some(bundled.to_string_lossy().into_owned());
+        }
+    }
     tracing::info!(?cfg, ?mode, "starting matalu pipeline");
     let silence_ms = cfg.silence_ms;
 
@@ -55,9 +78,10 @@ pub fn start(app: AppHandle, mode: Mode) -> anyhow::Result<Started> {
         }
     };
 
-    // Session owns the listening state and the audio gate flag (starts Idle).
-    let feed_real = Arc::new(AtomicBool::new(false));
-    let session = Session::new(app.clone(), inject, feed_real.clone(), mode, silence_ms);
+    // Session owns the listening state and the audio gate mode (starts Idle =
+    // feed nothing, so the sidecar idles until the first dictation).
+    let gate_mode = Arc::new(AtomicU8::new(gate::NONE));
+    let session = Session::new(app.clone(), inject, gate_mode.clone(), mode, silence_ms);
 
     // Transcript fan-out: one producer, consumers = the forwarder.
     let (events_tx, events_rx) = broadcast::channel::<TranscriptEvent>(256);
@@ -75,7 +99,7 @@ pub fn start(app: AppHandle, mode: Mode) -> anyhow::Result<Started> {
     // capture --(gate)--> sidecar. Both legs bounded + lossy (drop, never block).
     let (capture_tx, capture_rx) = crossbeam_channel::bounded::<Vec<f32>>(64);
     let (sidecar_tx, sidecar_rx) = crossbeam_channel::bounded::<Vec<f32>>(64);
-    spawn_audio_gate(capture_rx, sidecar_tx, feed_real);
+    spawn_audio_gate(capture_rx, sidecar_tx, gate_mode);
 
     let corrector = Arc::new(PassThrough);
     let sc = sidecar::spawn(cfg, sidecar_rx, events_tx, corrector)?;
@@ -97,46 +121,69 @@ pub fn start(app: AppHandle, mode: Mode) -> anyhow::Result<Started> {
     Ok(Started { session, child: Some(sc.child) })
 }
 
-/// Forward mic buffers to the sidecar, substituting silence while the session is
-/// idle so the model never hears real speech outside a dictation window (and the
-/// sidecar's VAD stays reset). Lossy like the capture callback.
+/// A bundled sidecar executable sitting next to the app binary in a packaged
+/// macOS `.app`, if present. Tauri's `externalBin` copies it into
+/// `Contents/MacOS/` (suffix stripped) at bundle time — but it *also* copies it
+/// next to the **dev** binary (`target/debug/`) on a plain `cargo build`, so we
+/// must gate on actually running from `…/Contents/MacOS/` or `cargo tauri dev`
+/// would exec the placeholder stub instead of falling back to the Python script.
+fn bundled_sidecar_path() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    if dir.file_name()?.to_str()? != "MacOS" {
+        return None; // not a packaged .app (e.g. dev target/debug) — use Python
+    }
+    let candidate = dir.join("matalu-sidecar");
+    candidate.exists().then_some(candidate)
+}
+
+/// Forward mic buffers to the sidecar according to the session's [`gate`] mode:
+/// [`gate::REAL`] passes mic audio, [`gate::SILENCE`] substitutes a same-length
+/// silent buffer (so the sidecar's VAD flushes a trailing `final`), and
+/// [`gate::NONE`] forwards *nothing* — the sidecar's blocking read parks and it
+/// stops inferring between dictations. Lossy like the capture callback.
 fn spawn_audio_gate(
     capture_rx: crossbeam_channel::Receiver<Vec<f32>>,
     sidecar_tx: crossbeam_channel::Sender<Vec<f32>>,
-    feed_real: Arc<AtomicBool>,
+    gate_mode: Arc<AtomicU8>,
 ) {
     std::thread::Builder::new()
         .name("audio-gate".into())
         .spawn(move || {
-            let mut was_real = false;
+            let mut prev = gate::NONE;
             let mut real_samples: u64 = 0;
             let mut peak: f32 = 0.0;
             while let Ok(buf) = capture_rx.recv() {
-                let real = feed_real.load(Ordering::Relaxed);
-                let out = if real {
-                    // Track signal level of forwarded audio (debug: mic-level diag).
-                    for &s in &buf {
-                        peak = peak.max(s.abs());
+                let mode = gate_mode.load(Ordering::Relaxed);
+                if mode != prev {
+                    match mode {
+                        gate::REAL => {
+                            tracing::debug!("gate: now forwarding real mic audio");
+                            real_samples = 0;
+                            peak = 0.0;
+                        }
+                        gate::SILENCE => tracing::debug!("gate: forwarding silence (draining)"),
+                        _ => tracing::debug!("gate: idle (forwarding nothing)"),
                     }
-                    real_samples += buf.len() as u64;
-                    if !was_real {
-                        tracing::debug!("gate: now forwarding real mic audio");
-                        real_samples = 0;
-                        peak = 0.0;
+                    prev = mode;
+                }
+                let out = match mode {
+                    gate::REAL => {
+                        // Track signal level of forwarded audio (debug: mic-level diag).
+                        for &s in &buf {
+                            peak = peak.max(s.abs());
+                        }
+                        real_samples += buf.len() as u64;
+                        if real_samples >= TARGET_SAMPLE_RATE as u64 / 2 {
+                            tracing::debug!(peak, "gate: real-audio level (last ~0.5s, 1.0=max)");
+                            real_samples = 0;
+                            peak = 0.0;
+                        }
+                        buf
                     }
-                    if real_samples >= TARGET_SAMPLE_RATE as u64 / 2 {
-                        tracing::debug!(peak, "gate: real-audio level (last ~0.5s, 1.0=max)");
-                        real_samples = 0;
-                        peak = 0.0;
-                    }
-                    buf
-                } else {
-                    if was_real {
-                        tracing::debug!("gate: back to silence");
-                    }
-                    vec![0.0f32; buf.len()] // silence, same cadence
+                    gate::SILENCE => vec![0.0f32; buf.len()], // silence, same cadence
+                    _ => continue,                            // NONE: drop, feed nothing
                 };
-                was_real = real;
                 let _ = sidecar_tx.try_send(out);
             }
             tracing::info!("audio gate: capture channel closed");

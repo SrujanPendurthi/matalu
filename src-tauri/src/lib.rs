@@ -6,12 +6,15 @@
 //! text injection, activated by a global hotkey.
 
 mod commands;
+mod fnkey;
 mod hotkey;
 mod injector;
 mod pipeline;
 mod session;
 mod settings;
 mod tray;
+
+use crate::settings::HotkeyPreset;
 
 use tauri::{LogicalPosition, Manager};
 
@@ -67,13 +70,22 @@ pub fn run() {
             // Start the core pipeline; get the session + sidecar child.
             let started = pipeline::start(handle, mode)?;
 
-            // The hotkey handler resolves the session from managed state.
+            // The hotkey handler resolves the session from managed state; keep a
+            // clone for the fn-key tap (which holds the session directly).
+            let session = started.session.clone();
             app.manage(started.session);
             app.manage(AppState {
                 _sidecar_child: std::sync::Mutex::new(started.child),
             });
 
-            hotkey::register(app, cfg.hotkey.shortcut())?;
+            // Fn (Globe) is driven by a CGEventTap; every other preset is a
+            // plugin global shortcut. (Switching to/from Fn takes effect on the
+            // next launch — see commands::set_settings.)
+            match cfg.hotkey.shortcut() {
+                Some(shortcut) => hotkey::register(app, shortcut)?,
+                None if cfg.hotkey == HotkeyPreset::Fn => fnkey::spawn(session),
+                None => {}
+            }
             tray::build(app)?;
             Ok(())
         })

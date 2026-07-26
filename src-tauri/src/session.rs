@@ -16,7 +16,7 @@
 //! speech to the model when the user isn't dictating (privacy), while the
 //! sidecar's existing silence-VAD segmentation keeps working unchanged.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,6 +24,7 @@ use matalu::events::TranscriptEvent;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::injector::InjectorHandle;
+use crate::pipeline::gate;
 
 /// Tauri event carrying `{ "listening": bool }` for the UI status indicator.
 pub const STATUS_EVENT: &str = "status";
@@ -50,9 +51,9 @@ pub struct Session {
     /// True once the sidecar is warm and mic capture is live. Activation before
     /// this is ignored (the pipeline can't hear anything yet).
     ready: Arc<AtomicBool>,
-    /// Read by the audio gate thread: true → forward real mic audio to the
-    /// sidecar; false → forward silence.
-    feed_real: Arc<AtomicBool>,
+    /// Read by the audio gate thread; one of [`gate::NONE`]/[`gate::SILENCE`]/
+    /// [`gate::REAL`]. Drives what the sidecar hears per dictation phase.
+    gate: Arc<AtomicU8>,
     /// None when injection is disabled/unavailable (UI still updates).
     injector: Option<InjectorHandle>,
     app: AppHandle,
@@ -68,7 +69,7 @@ impl Session {
     pub fn new(
         app: AppHandle,
         injector: Option<InjectorHandle>,
-        feed_real: Arc<AtomicBool>,
+        gate: Arc<AtomicU8>,
         mode: Mode,
         silence_ms: u64,
     ) -> Arc<Self> {
@@ -76,7 +77,7 @@ impl Session {
             state: Mutex::new(State::Idle),
             mode: Mutex::new(mode),
             ready: Arc::new(AtomicBool::new(false)),
-            feed_real,
+            gate,
             injector,
             app,
             last_partial: Mutex::new(None),
@@ -147,7 +148,7 @@ impl Session {
         if let Some(i) = &self.injector {
             i.reset();
         }
-        self.feed_real.store(true, Ordering::Relaxed);
+        self.gate.store(gate::REAL, Ordering::Relaxed);
         drop(st);
         self.emit_status(true);
         self.set_pill(true);
@@ -160,7 +161,7 @@ impl Session {
             return;
         }
         *st = State::Draining;
-        self.feed_real.store(false, Ordering::Relaxed); // sidecar now gets silence
+        self.gate.store(gate::SILENCE, Ordering::Relaxed); // sidecar now gets silence
         let gen = self.drain_gen.fetch_add(1, Ordering::Relaxed) + 1;
         drop(st);
         self.emit_status(false);
@@ -180,6 +181,7 @@ impl Session {
                 return; // superseded by a newer session, or already finished
             }
             *st = State::Idle;
+            me.gate.store(gate::NONE, Ordering::Relaxed); // stop feeding the sidecar
             drop(st);
             if let Some(i) = &me.injector {
                 if let Some(text) = me.last_partial.lock().unwrap().take() {
@@ -216,6 +218,7 @@ impl Session {
                 *self.last_partial.lock().unwrap() = None;
                 if *st == State::Draining {
                     *st = State::Idle;
+                    self.gate.store(gate::NONE, Ordering::Relaxed); // stop feeding the sidecar
                     self.drain_gen.fetch_add(1, Ordering::Relaxed);
                     drop(st);
                     self.emit_status(false);

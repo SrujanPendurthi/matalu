@@ -33,15 +33,27 @@ pub fn spawn(
     events_tx: broadcast::Sender<TranscriptEvent>,
     corrector: Arc<dyn Corrector>,
 ) -> Result<Sidecar> {
-    tracing::info!(
-        python = %cfg.python_bin,
-        script = %cfg.sidecar_script,
-        model = %cfg.mlx_model,
-        "starting parakeet-mlx sidecar"
-    );
+    // Either run a self-contained bundled executable directly, or launch the
+    // Python script via the interpreter (dev). Same protocol either way.
+    let mut command = match &cfg.sidecar_bin {
+        Some(bin) => {
+            tracing::info!(bin = %bin, model = %cfg.mlx_model, "starting bundled parakeet-mlx sidecar");
+            Command::new(bin)
+        }
+        None => {
+            tracing::info!(
+                python = %cfg.python_bin,
+                script = %cfg.sidecar_script,
+                model = %cfg.mlx_model,
+                "starting parakeet-mlx sidecar"
+            );
+            let mut c = Command::new(&cfg.python_bin);
+            c.arg(&cfg.sidecar_script);
+            c
+        }
+    };
 
-    let mut child = Command::new(&cfg.python_bin)
-        .arg(&cfg.sidecar_script)
+    let mut child = command
         .env("MATALU_MLX_MODEL", &cfg.mlx_model)
         .env("MATALU_SILENCE_MS", cfg.silence_ms.to_string())
         .env("MATALU_VAD_RMS", cfg.vad_rms_threshold.to_string())
@@ -49,7 +61,10 @@ pub fn spawn(
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .with_context(|| format!("failed to spawn sidecar: {} {}", cfg.python_bin, cfg.sidecar_script))?;
+        .with_context(|| match &cfg.sidecar_bin {
+            Some(bin) => format!("failed to spawn bundled sidecar: {bin}"),
+            None => format!("failed to spawn sidecar: {} {}", cfg.python_bin, cfg.sidecar_script),
+        })?;
 
     let mut stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");

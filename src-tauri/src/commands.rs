@@ -25,10 +25,16 @@ pub fn set_settings(
 ) -> Result<(), String> {
     session.set_mode(settings.activation_mode.into());
 
+    // Clear any existing plugin hotkey, then (re)register unless the new preset
+    // is Fn. Fn is a CGEventTap started at launch; switching *to* Fn just drops
+    // the plugin hotkey now and the tap comes up on the next launch (starting a
+    // run-loop tap mid-session isn't supported here).
     let gs = app.global_shortcut();
     let _ = gs.unregister_all();
-    gs.register(settings.hotkey.shortcut())
-        .map_err(|e| format!("failed to register hotkey: {e}"))?;
+    if let Some(shortcut) = settings.hotkey.shortcut() {
+        gs.register(shortcut)
+            .map_err(|e| format!("failed to register hotkey: {e}"))?;
+    }
 
     settings::save(&app, &settings).map_err(|e| e.to_string())?;
     Ok(())

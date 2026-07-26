@@ -13,6 +13,10 @@
 __pycache__/
 *.pyc
 .venv/
+# PyInstaller sidecar build artifacts (the staged binary overwrites the
+# committed placeholder at src-tauri/binaries/ — don't commit the built binary).
+/sidecar/build/
+/sidecar/dist/
 # Test/scratch audio
 *.wav
 *.aiff

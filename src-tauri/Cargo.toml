@@ -21,6 +21,8 @@ tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-ap
 # System-wide text injection: synthetic keys (CoreGraphics) + clipboard (arboard).
 arboard = "3"
 core-graphics = "0.25"
+# fn-key (Globe) global hold via a CGEventTap driven on its own CFRunLoop.
+core-foundation = "0.10"
 
 tokio = { workspace = true, features = ["time"] }
 serde.workspace = true

@@ -27,8 +27,9 @@ impl From<ActivationMode> for Mode {
     }
 }
 
-/// A fixed set of activation-hotkey choices. (Modifier-only / arbitrary capture
-/// is deferred; those need a CGEventTap or key-capture UI.)
+/// A fixed set of activation-hotkey choices. `Fn` (the Globe key) is special:
+/// it can't be a `tauri-plugin-global-shortcut` binding, so it's driven by a
+/// CGEventTap instead (see [`crate::fnkey`]). Arbitrary key capture is deferred.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum HotkeyPreset {
@@ -36,18 +37,22 @@ pub enum HotkeyPreset {
     CtrlSpace,
     CmdShiftSpace,
     F5,
+    Fn,
 }
 
 impl HotkeyPreset {
-    pub fn shortcut(self) -> Shortcut {
-        match self {
+    /// The plugin shortcut for this preset, or `None` for [`HotkeyPreset::Fn`]
+    /// (which is handled by the CGEventTap in [`crate::fnkey`], not the plugin).
+    pub fn shortcut(self) -> Option<Shortcut> {
+        Some(match self {
             HotkeyPreset::AltSpace => Shortcut::new(Some(Modifiers::ALT), Code::Space),
             HotkeyPreset::CtrlSpace => Shortcut::new(Some(Modifiers::CONTROL), Code::Space),
             HotkeyPreset::CmdShiftSpace => {
                 Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Space)
             }
             HotkeyPreset::F5 => Shortcut::new(None, Code::F5),
-        }
+            HotkeyPreset::Fn => return None,
+        })
     }
 }
 

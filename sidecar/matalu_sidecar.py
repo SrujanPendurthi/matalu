@@ -52,10 +52,12 @@ VAD_RMS = float(os.environ.get("MATALU_VAD_RMS", "0.010"))
 CHUNK = SR // 2  # 0.5 s processing granularity
 
 # Streaming attention context (left, right) in encoder frames. This is the main
-# speed/accuracy knob: the default (256,256) decodes BELOW real time (~0.6x RTF)
-# on an M4, while (64,64) runs ~1.4x RTF with no measurable accuracy loss on our
-# tests. Larger = more accurate but slower; too small (e.g. 32,16) collapses.
-_ctx = os.environ.get("MATALU_MLX_CONTEXT", "64,64").split(",")
+# speed/accuracy knob. Measured on this hardware (5.7s utterance):
+#   (64,64)   RTF 0.9-1.4x, but DROPS the utterance start (too little warmup ctx)
+#   (128,128) RTF ~1.1x, start recovered — real-time and clearly better (default)
+#   (256,256) same accuracy as 128 but RTF ~0.7x (below real time — it lags)
+# Larger = more accurate but slower; too small (e.g. 32,16) collapses.
+_ctx = os.environ.get("MATALU_MLX_CONTEXT", "128,128").split(",")
 CONTEXT_SIZE = (int(_ctx[0]), int(_ctx[1]))
 
 
@@ -89,6 +91,20 @@ def main() -> None:
     sys.stdout.write(json.dumps({"type": "ready"}) + "\n")
     sys.stdout.flush()
 
+    # Diagnostic: when MATALU_DUMP_WAV is set, write exactly the audio this
+    # process receives (post-resample, post-gate) to a 16 kHz mono WAV, so a bad
+    # live transcript can be replayed/analyzed offline — isolates a mic/capture
+    # problem (the WAV itself sounds wrong) from a streaming one (WAV is fine).
+    dump = None
+    dump_path = os.environ.get("MATALU_DUMP_WAV")
+    if dump_path:
+        import wave
+        dump = wave.open(dump_path, "wb")
+        dump.setnchannels(1)
+        dump.setsampwidth(2)
+        dump.setframerate(SR)
+        log(f"dumping received audio to {dump_path}")
+
     stdin = sys.stdin.buffer
     processed = 0        # total samples consumed (for timestamps)
     silence_ms = 0
@@ -110,6 +126,9 @@ def main() -> None:
             processed += n
             ts_ms = processed * 1000 // SR
 
+            if dump is not None:
+                dump.writeframes((np.clip(samples, -1.0, 1.0) * 32767).astype("<i2").tobytes())
+
             rms = float(np.sqrt(np.mean(np.square(samples)))) if n else 0.0
             # Always feed audio so the streaming cache stays continuous and
             # trailing words flush during the silence tail.
@@ -130,11 +149,21 @@ def main() -> None:
                     tx = ctx.__enter__()
                     in_utterance = False
                     silence_ms = 0
+                    # Release MLX's pooled scratch/activation buffers now that
+                    # we're going idle (the gate parks stdin after a final, so
+                    # inference stops). Weights stay resident → the next
+                    # utterance is still instant. macOS can't reclaim this pool
+                    # itself — MLX holds live allocator refs, so it reads as
+                    # in-use. Clears ~half the resident footprint between
+                    # dictations.
+                    mx.clear_cache()
     finally:
         try:
             ctx.__exit__(None, None, None)
         except Exception:
             pass
+        if dump is not None:
+            dump.close()
     log("stdin closed; exiting")
 
 

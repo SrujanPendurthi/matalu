@@ -1,0 +1,15 @@
+#!/bin/sh
+# PLACEHOLDER — not the real sidecar.
+#
+# Tauri's `externalBin` requires this file to exist at build time, so this stub
+# is committed to keep `cargo build` / `cargo tauri dev` working. Tauri copies it
+# next to the dev binary too, but the app only prefers a bundled sidecar when
+# running from a packaged `…/Contents/MacOS/` .app — so in dev it falls back to
+# the Python script and this stub is never executed.
+#
+# Before packaging (`cargo tauri build`), run `sidecar/build_sidecar.sh` to
+# replace this with the real PyInstaller-built sidecar. If you package without
+# doing so, the bundled app will print this message and exit instead of
+# transcribing — a loud, honest failure rather than a silent broken build.
+echo "[matalu-sidecar] placeholder binary: run sidecar/build_sidecar.sh to build the real sidecar before packaging." >&2
+exit 1
