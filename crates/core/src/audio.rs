@@ -70,10 +70,10 @@ impl LinearResampler {
 /// permission is resolved. Doing this on its own thread keeps that latency (and
 /// any permission stall) off the server's startup path — `/health` and `/ws`
 /// come up immediately regardless of mic state.
-pub fn spawn_capture(target_rate: u32, tx: Sender<Vec<f32>>) {
+pub fn spawn_capture(target_rate: u32, device_name: Option<String>, tx: Sender<Vec<f32>>) {
     std::thread::Builder::new()
         .name("audio-capture".into())
-        .spawn(move || match open_stream(target_rate, tx) {
+        .spawn(move || match open_stream(target_rate, device_name.as_deref(), tx) {
             Ok(_stream) => {
                 tracing::info!("microphone capture running");
                 // Keep `_stream` alive (dropping it stops capture); callbacks
@@ -88,11 +88,27 @@ pub fn spawn_capture(target_rate: u32, tx: Sender<Vec<f32>>) {
 }
 
 /// Build + start the input stream (blocking on macOS mic permission).
-fn open_stream(target_rate: u32, tx: Sender<Vec<f32>>) -> Result<Stream> {
+///
+/// `device_name` selects a specific input device by name (e.g. an Aggregate
+/// Device merging mic + system audio); `None` uses the system default mic.
+fn open_stream(target_rate: u32, device_name: Option<&str>, tx: Sender<Vec<f32>>) -> Result<Stream> {
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| anyhow!("no default input device (microphone) found"))?;
+    let device = match device_name {
+        Some(name) => {
+            let mut found = None;
+            // cpal 0.18 exposes the device name via `Display`, not a `name()` method.
+            for d in host.input_devices().context("failed to enumerate input devices")? {
+                if d.to_string() == name {
+                    found = Some(d);
+                    break;
+                }
+            }
+            found.ok_or_else(|| anyhow!("input device not found: {name}"))?
+        }
+        None => host
+            .default_input_device()
+            .ok_or_else(|| anyhow!("no default input device (microphone) found"))?,
+    };
     let supported = device
         .default_input_config()
         .context("failed to read default input config")?;

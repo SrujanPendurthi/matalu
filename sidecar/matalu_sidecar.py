@@ -49,6 +49,11 @@ def resolve_model() -> str:
 
 SILENCE_MS = int(os.environ.get("MATALU_SILENCE_MS", "700"))
 VAD_RMS = float(os.environ.get("MATALU_VAD_RMS", "0.010"))
+# Force a `final` + context reset after this much *continuous* speech even
+# without a silence gap. Dictation rarely hits it; meeting audio (monologues,
+# overlapping speakers) can run for minutes with no 700 ms gap, which would
+# otherwise grow one endless partial and let the streaming context balloon.
+MAX_UTTERANCE_MS = int(os.environ.get("MATALU_MAX_UTTERANCE_MS", "12000"))
 CHUNK = SR // 2  # 0.5 s processing granularity
 
 # Streaming attention context (left, right) in encoder frames. This is the main
@@ -108,6 +113,7 @@ def main() -> None:
     stdin = sys.stdin.buffer
     processed = 0        # total samples consumed (for timestamps)
     silence_ms = 0
+    utterance_ms = 0     # continuous-speech duration since the last final
     in_utterance = False
 
     ctx = model.transcribe_stream(context_size=CONTEXT_SIZE)
@@ -125,6 +131,7 @@ def main() -> None:
             samples = np.frombuffer(data[: n * 4], dtype=np.float32)
             processed += n
             ts_ms = processed * 1000 // SR
+            step_ms = n * 1000 // SR
 
             if dump is not None:
                 dump.writeframes((np.clip(samples, -1.0, 1.0) * 32767).astype("<i2").tobytes())
@@ -137,11 +144,18 @@ def main() -> None:
             if rms > VAD_RMS:
                 in_utterance = True
                 silence_ms = 0
-                emit("partial", tx.result.text, ts_ms)
+                utterance_ms += step_ms
             elif in_utterance:
-                silence_ms += n * 1000 // SR
+                silence_ms += step_ms
+                utterance_ms += step_ms
+
+            if in_utterance:
                 emit("partial", tx.result.text, ts_ms)
-                if silence_ms >= SILENCE_MS:
+                # Commit + reset on a silence gap (utterance ended) OR the
+                # max-utterance cap (long continuous speech that never pauses,
+                # e.g. a meeting monologue) so the transcript keeps flowing and
+                # the streaming context stays bounded.
+                if silence_ms >= SILENCE_MS or utterance_ms >= MAX_UTTERANCE_MS:
                     emit("final", tx.result.text, ts_ms)
                     # Reset streaming state for the next utterance.
                     ctx.__exit__(None, None, None)
@@ -149,13 +163,13 @@ def main() -> None:
                     tx = ctx.__enter__()
                     in_utterance = False
                     silence_ms = 0
-                    # Release MLX's pooled scratch/activation buffers now that
-                    # we're going idle (the gate parks stdin after a final, so
-                    # inference stops). Weights stay resident → the next
-                    # utterance is still instant. macOS can't reclaim this pool
-                    # itself — MLX holds live allocator refs, so it reads as
-                    # in-use. Clears ~half the resident footprint between
-                    # dictations.
+                    utterance_ms = 0
+                    # Release MLX's pooled scratch/activation buffers. Weights
+                    # stay resident → the next utterance is still instant; macOS
+                    # can't reclaim this pool itself (MLX holds live refs).
+                    # ponytail: in meeting mode this fires on every capped final
+                    # (~12 s) — a cheap realloc churn, not a model reload; tighten
+                    # only if it measurably hurts.
                     mx.clear_cache()
     finally:
         try:

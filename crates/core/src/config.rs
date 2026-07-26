@@ -24,6 +24,9 @@ pub struct Config {
     pub silence_ms: u64,
     /// RMS threshold below which a chunk is silence (passed to the sidecar).
     pub vad_rms_threshold: f32,
+    /// Optional input device name to capture (e.g. an Aggregate Device that
+    /// merges mic + system audio for meeting transcription). `None` = default mic.
+    pub input_device: Option<String>,
 }
 
 impl Config {
@@ -36,6 +39,7 @@ impl Config {
     /// - `MATALU_MLX_MODEL`   (default `mlx-community/parakeet-tdt-0.6b-v2`)
     /// - `MATALU_SILENCE_MS`  (default `700`)
     /// - `MATALU_VAD_RMS`     (default `0.010`)
+    /// - `MATALU_INPUT_DEVICE` (optional; capture a named input device instead of the default mic)
     pub fn from_env() -> anyhow::Result<Self> {
         fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
             std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
@@ -54,6 +58,7 @@ impl Config {
             mlx_model: env_str("MATALU_MLX_MODEL", "mlx-community/parakeet-tdt-0.6b-v2"),
             silence_ms: env_or("MATALU_SILENCE_MS", 700),
             vad_rms_threshold: env_or("MATALU_VAD_RMS", 0.010_f32),
+            input_device: std::env::var("MATALU_INPUT_DEVICE").ok().filter(|s| !s.is_empty()),
         })
     }
 }

@@ -68,6 +68,23 @@ pub fn show_settings_window(app: AppHandle) {
     show_settings(&app);
 }
 
+/// Save the meeting transcript to a timestamped .txt in the user's Documents
+/// folder; returns the written path for the UI to display.
+#[tauri::command]
+pub fn save_transcript(app: AppHandle, text: String) -> Result<String, String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dir = app.path().document_dir().map_err(|e| e.to_string())?;
+    let path = dir.join(format!("matalu-transcript-{ts}.txt"));
+    std::fs::write(&path, text).map_err(|e| e.to_string())?;
+    let p = path.to_string_lossy().into_owned();
+    tracing::info!(path = %p, "transcript saved");
+    Ok(p)
+}
+
 /// Reveal the predefined settings window.
 pub fn show_settings(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("settings") {

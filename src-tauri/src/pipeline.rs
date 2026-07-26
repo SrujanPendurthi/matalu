@@ -63,6 +63,7 @@ pub fn start(app: AppHandle, mode: Mode) -> anyhow::Result<Started> {
     }
     tracing::info!(?cfg, ?mode, "starting matalu pipeline");
     let silence_ms = cfg.silence_ms;
+    let input_device = cfg.input_device.clone();
 
     // Text injection is on by default (gated by the session); MATALU_NO_INJECT
     // disables it for pure UI testing.
@@ -120,7 +121,7 @@ pub fn start(app: AppHandle, mode: Mode) -> anyhow::Result<Started> {
             Ok(()) => tracing::info!("sidecar ready; starting microphone capture"),
             Err(_) => tracing::warn!("sidecar not ready after 180s; starting capture anyway"),
         }
-        audio::spawn_capture(TARGET_SAMPLE_RATE, capture_tx);
+        audio::spawn_capture(TARGET_SAMPLE_RATE, input_device, capture_tx);
         session_ready.mark_ready();
     });
 

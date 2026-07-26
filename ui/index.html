@@ -18,6 +18,10 @@
   }
   header h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: .3px; }
   #status { font-size: 13px; color: #8b90a0; margin-left: auto; display: flex; align-items: center; gap: 6px; }
+  .btn { font: inherit; font-size: 13px; color: #cfd3df; background: #1a1d25;
+         border: 1px solid #2c303b; border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+  .btn:hover { background: #232733; }
+  .btn:active { background: #2c313f; }
   #dot { width: 9px; height: 9px; border-radius: 50%; background: #d15b5b; }
   #dot.on { background: #4caf72; }
   main { flex: 1; overflow-y: auto; padding: 20px; }
@@ -37,29 +41,33 @@
   <header>
     <h1>Matalu</h1>
     <span id="status"><span id="dot"></span><span id="statustext">starting…</span></span>
+    <button id="save" class="btn">Save</button>
+    <button id="clear" class="btn">Clear</button>
   </header>
   <main id="log">
     <p class="empty" id="hint">Finalized lines appear here; live text below.</p>
   </main>
   <p class="line partial" id="partial"></p>
-  <footer>Transcripts stream over Tauri IPC (<code>transcript</code> event).</footer>
+  <footer id="footer">Transcripts stream over Tauri IPC (<code>transcript</code> event).</footer>
 
   <script>
     const log = document.getElementById('log');
     const partialEl = document.getElementById('partial');
     const dot = document.getElementById('dot');
     const statustext = document.getElementById('statustext');
+    const footer = document.getElementById('footer');
     let hint = document.getElementById('hint');
+    const finals = [];  // committed transcript lines, for Save
 
     function onEvent(m) {
       if (hint) { hint.remove(); hint = null; }
       dot.classList.add('on');
-      statustext.textContent = 'listening';
       if (m.type === 'partial') {
         partialEl.innerHTML = '';
         partialEl.append(document.createTextNode(m.text));
         const c = document.createElement('span'); c.className = 'cursor'; partialEl.append(c);
       } else if (m.type === 'final') {
+        finals.push(m.text);
         const p = document.createElement('p');
         p.className = 'line final';
         p.textContent = m.text;
@@ -69,11 +77,34 @@
       }
     }
 
+    async function saveTranscript() {
+      if (!finals.length) { footer.textContent = 'Nothing to save yet.'; return; }
+      try {
+        const path = await window.__TAURI__.core.invoke('save_transcript', { text: finals.join('\n') });
+        footer.textContent = 'Saved: ' + path;
+      } catch (e) {
+        footer.textContent = 'Save failed: ' + e;
+      }
+    }
+
+    function clearTranscript() {
+      finals.length = 0;
+      log.innerHTML = '';
+      partialEl.innerHTML = '';
+      footer.textContent = 'Cleared.';
+    }
+
+    document.getElementById('save').addEventListener('click', saveTranscript);
+    document.getElementById('clear').addEventListener('click', clearTranscript);
+
     let ready = false;
     function onStatus(s) {
       s = s || {};
       if (s.state === 'ready') ready = true;
-      if (s.listening) {
+      if (s.state === 'meeting') {
+        dot.classList.add('on');
+        statustext.textContent = 'meeting recording';
+      } else if (s.listening) {
         dot.classList.add('on');
         statustext.textContent = 'listening';
       } else if (s.state === 'warming' || !ready) {

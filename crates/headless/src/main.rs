@@ -43,12 +43,13 @@ async fn main() -> Result<()> {
     // Gate mic capture on sidecar readiness: starting the mic while the model is
     // still loading backs up the pipe and drops audio. Wait for the ready signal
     // (bounded) on a helper thread so the server can come up immediately.
+    let input_device = cfg.input_device.clone();
     std::thread::spawn(move || {
         match sc.ready.recv_timeout(std::time::Duration::from_secs(180)) {
             Ok(()) => tracing::info!("sidecar ready; starting microphone capture"),
             Err(_) => tracing::warn!("sidecar not ready after 180s; starting capture anyway"),
         }
-        audio::spawn_capture(TARGET_SAMPLE_RATE, audio_tx);
+        audio::spawn_capture(TARGET_SAMPLE_RATE, input_device, audio_tx);
     });
 
     // Serve until Ctrl-C.

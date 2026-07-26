@@ -44,6 +44,7 @@ pub fn run() {
             commands::get_permissions,
             commands::open_accessibility_settings,
             commands::show_settings_window,
+            commands::save_transcript,
         ])
         .setup(|app| {
             // Menu-bar-only: no dock icon, no app window in ⌘-Tab. The UI lives

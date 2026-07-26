@@ -51,6 +51,9 @@ pub struct Session {
     /// True once the sidecar is warm and mic capture is live. Activation before
     /// this is ignored (the pipeline can't hear anything yet).
     ready: Arc<AtomicBool>,
+    /// Meeting-transcript mode: capture runs continuously, transcripts fill the
+    /// window but are **not** injected, and the dictation hotkey is ignored.
+    meeting: AtomicBool,
     /// Read by the audio gate thread; one of [`gate::NONE`]/[`gate::SILENCE`]/
     /// [`gate::REAL`]. Drives what the sidecar hears per dictation phase.
     gate: Arc<AtomicU8>,
@@ -77,6 +80,7 @@ impl Session {
             state: Mutex::new(State::Idle),
             mode: Mutex::new(mode),
             ready: Arc::new(AtomicBool::new(false)),
+            meeting: AtomicBool::new(false),
             gate,
             injector,
             app,
@@ -102,10 +106,56 @@ impl Session {
         tracing::info!("session: ready (mic live, model warm)");
     }
 
+    // --- meeting transcript mode ---------------------------------------------
+
+    pub fn is_meeting(&self) -> bool {
+        self.meeting.load(Ordering::Relaxed)
+    }
+
+    /// Start meeting transcription: capture continuously (gate always `REAL`),
+    /// show the transcript window, and stop injecting. No-op until the pipeline
+    /// is ready (mic live + model warm).
+    pub fn start_meeting(self: &Arc<Self>) {
+        if !self.ready.load(Ordering::Relaxed) {
+            tracing::warn!("meeting ignored: pipeline still warming up (model loading)");
+            let _ = self.app.emit(
+                STATUS_EVENT,
+                serde_json::json!({ "listening": false, "state": "warming" }),
+            );
+            return;
+        }
+        self.meeting.store(true, Ordering::Relaxed);
+        *self.state.lock().unwrap() = State::Listening;
+        self.gate.store(gate::REAL, Ordering::Relaxed);
+        if let Some(win) = self.app.get_webview_window("main") {
+            let _ = win.show();
+            let _ = win.set_focus();
+        }
+        let _ = self
+            .app
+            .emit(STATUS_EVENT, serde_json::json!({ "listening": true, "state": "meeting" }));
+        tracing::info!("session: meeting transcript started");
+    }
+
+    /// Stop meeting transcription: idle the capture and hide the window.
+    pub fn stop_meeting(self: &Arc<Self>) {
+        self.meeting.store(false, Ordering::Relaxed);
+        *self.state.lock().unwrap() = State::Idle;
+        self.gate.store(gate::NONE, Ordering::Relaxed);
+        if let Some(win) = self.app.get_webview_window("main") {
+            let _ = win.hide();
+        }
+        self.emit_status(false);
+        tracing::info!("session: meeting transcript stopped");
+    }
+
     // --- hotkey entry points -------------------------------------------------
 
     /// Hotkey pressed.
     pub fn on_press(self: &Arc<Self>) {
+        if self.meeting.load(Ordering::Relaxed) {
+            return; // dictation hotkey is inert while a meeting is recording
+        }
         let mode = *self.mode.lock().unwrap();
         match mode {
             Mode::PushToTalk => self.start(),
@@ -122,6 +172,9 @@ impl Session {
 
     /// Hotkey released (only meaningful for push-to-talk).
     pub fn on_release(self: &Arc<Self>) {
+        if self.meeting.load(Ordering::Relaxed) {
+            return;
+        }
         if *self.mode.lock().unwrap() == Mode::PushToTalk {
             self.stop();
         }
@@ -200,6 +253,11 @@ impl Session {
 
     /// Feed a transcript event through the session. No-op while Idle.
     pub fn on_event(&self, ev: &TranscriptEvent) {
+        if self.meeting.load(Ordering::Relaxed) {
+            // Meeting mode: the UI receives every event via pipeline::forward();
+            // don't inject keystrokes or run the dictation state machine.
+            return;
+        }
         let mut st = self.state.lock().unwrap();
         if *st == State::Idle {
             return;
