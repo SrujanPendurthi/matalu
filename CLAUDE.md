@@ -30,7 +30,7 @@ sidecar/dump_and_analyze.sh              # dictation-accuracy diagnostic: run ap
 python3 sidecar/analyze_dump.py some_dump.wav      # analyze an existing MATALU_DUMP_WAV capture (mic-vs-streaming triage)
 ```
 
-Python deps for the sidecar: `python3 -m pip install parakeet-mlx` (pulls in mlx; a venv is recommended). The MLX model (~1.2 GB) downloads and caches automatically on first sidecar run. Grant microphone permission on first real run. The desktop app additionally needs **Accessibility** permission (for text injection). Default sidecar path (`sidecar/matalu_sidecar.py`) is relative to CWD, so run from the workspace root in dev.
+Python deps for the sidecar: `python3 -m pip install parakeet-mlx` (pulls in mlx; a venv is recommended). The MLX model (~1.2 GB) downloads and caches automatically on first sidecar run. Grant microphone permission on first real run. The desktop app additionally needs **Accessibility** permission (for text injection). Sidecar path: the **headless** frontend uses the relative default (`sidecar/matalu_sidecar.py`), so run it from the workspace root. The **app** (`cargo tauri dev`) runs with CWD `src-tauri/`, so `pipeline.rs` anchors the dev script to `CARGO_MANIFEST_DIR/../sidecar/matalu_sidecar.py` — no CWD requirement; override with `MATALU_SIDECAR`.
 
 In `cargo tauri dev` the `main` transcript window no longer appears — it launches hidden. The visible surfaces are the **menu-bar tray** (Settings…, Show/Hide, Quit) and the floating **pill** (shown only while dictating); reveal the transcript window via the tray's "Show / Hide Window".
 

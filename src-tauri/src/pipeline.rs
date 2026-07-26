@@ -53,6 +53,12 @@ pub fn start(app: AppHandle, mode: Mode) -> anyhow::Result<Started> {
         if let Some(bundled) = bundled_sidecar_path() {
             tracing::info!(path = %bundled.display(), "using bundled sidecar binary");
             cfg.sidecar_bin = Some(bundled.to_string_lossy().into_owned());
+        } else {
+            // Dev fallback: `cargo tauri dev` runs with CWD = src-tauri/, so the
+            // default relative script path (`sidecar/matalu_sidecar.py`) misses.
+            // Anchor to the crate dir at compile time → workspace-root/sidecar.
+            cfg.sidecar_script =
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../sidecar/matalu_sidecar.py").to_string();
         }
     }
     tracing::info!(?cfg, ?mode, "starting matalu pipeline");
