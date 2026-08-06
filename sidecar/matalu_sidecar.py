@@ -71,6 +71,10 @@ CHUNK = SR // 2  # 0.5 s processing granularity
 _ctx = os.environ.get("MATALU_MLX_CONTEXT", "128,128").split(",")
 CONTEXT_SIZE = (int(_ctx[0]), int(_ctx[1]))
 
+# Weight quantization for the ASR model. 8 is free (measured: no WER change,
+# -383 MB, 1.37x faster); 0 disables and keeps bf16. See quantize_model().
+ASR_BITS = int(os.environ.get("MATALU_ASR_BITS", "8"))
+
 
 def log(msg: str) -> None:
     sys.stderr.write(f"[sidecar] {msg}\n")
@@ -91,6 +95,45 @@ def new_stream(model):
     return ctx, ctx.__enter__()
 
 
+def quantize_model(model, bits: int) -> None:
+    """Quantize the encoder/decoder Linear layers in place (MLX affine, group 64).
+
+    `parakeet-mlx` has no quantization of its own and loads bf16, so this is
+    applied after `from_pretrained`. **The self-attention linears must be
+    skipped**: `transcribe_stream()` swaps in a `rel_pos_local_attn` module and
+    copies weights across with `load_weights()`, which rejects the extra
+    `scales`/`biases` a quantized Linear carries. Skipping them leaves ~100 of
+    220 Linear layers quantized — mostly the feed-forward blocks, which is where
+    the parameters are.
+
+    Measured on LibriSpeech test-clean (60 utts, streaming, context 128,128):
+
+        bf16   1236 MB   10.32% WER   1.01x RTF
+        8-bit   853 MB   10.32% WER   1.39x RTF   <- default: free
+        6-bit   751 MB   11.51% WER   1.32x RTF
+        4-bit   648 MB   15.48% WER   1.34x RTF   <- +50% relative, do not use
+
+    8-bit is strictly better than bf16 on every axis. Anything below it trades
+    real accuracy, so re-run the WER sweep before changing this default.
+    """
+    import mlx.nn as nn
+
+    skipped = 0
+
+    def should_quantize(path, module):
+        nonlocal skipped
+        if not isinstance(module, nn.Linear):
+            return False
+        if "self_attn" in path:
+            skipped += 1
+            return False
+        return True
+
+    nn.quantize(model, group_size=64, bits=bits, class_predicate=should_quantize)
+    mx.eval(model.parameters())
+    log(f"quantized to {bits}-bit (group 64), skipped {skipped} self_attn linears")
+
+
 def main() -> None:
     model_src = resolve_model()
     kind = "local dir" if os.path.isdir(model_src) else "Hub repo"
@@ -98,6 +141,14 @@ def main() -> None:
     model = from_pretrained(model_src)
     if model.preprocessor_config.sample_rate != SR:
         log(f"WARNING: model sample_rate={model.preprocessor_config.sample_rate}, expected {SR}")
+
+    # Best-effort: a quantization failure must not cost us the whole ASR stage,
+    # so fall back to the bf16 weights that are already loaded and keep going.
+    if ASR_BITS:
+        try:
+            quantize_model(model, ASR_BITS)
+        except Exception as e:  # noqa: BLE001
+            log(f"WARNING: quantization failed ({e!r}); continuing at bf16")
 
     # Warm up: run one throwaway inference so the Metal kernels compile now,
     # while the mic is still gated, rather than stalling the first real words.

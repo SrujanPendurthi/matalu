@@ -5,6 +5,7 @@
 //! fan-out, routes transcripts through a [`session::Session`] to system-wide
 //! text injection, activated by a global hotkey.
 
+mod cleaner;
 mod commands;
 mod diarize;
 mod fnkey;
@@ -70,7 +71,7 @@ pub fn run() {
             };
 
             // Start the core pipeline; get the session + sidecar child.
-            let started = pipeline::start(handle, mode)?;
+            let started = pipeline::start(handle, mode, cfg.cleanup)?;
 
             // The hotkey handler resolves the session from managed state; keep a
             // clone for the fn-key tap (which holds the session directly).

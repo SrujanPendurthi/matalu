@@ -24,6 +24,7 @@ pub fn set_settings(
     settings: Settings,
 ) -> Result<(), String> {
     session.set_mode(settings.activation_mode.into());
+    session.set_cleanup(settings.cleanup);
 
     // Clear any existing plugin hotkey, then (re)register unless the new preset
     // is Fn. Fn is a CGEventTap started at launch; switching *to* Fn just drops

@@ -18,6 +18,7 @@ use matalu::{audio, sidecar};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::broadcast;
 
+use crate::cleaner::Cleaner;
 use crate::injector;
 use crate::session::{Mode, Session};
 
@@ -112,7 +113,7 @@ pub struct Started {
 
 /// Start the pipeline and return the [`Session`] + sidecar child. `mode` is the
 /// initial activation mode (from persisted settings / env override).
-pub fn start(app: AppHandle, mode: Mode) -> anyhow::Result<Started> {
+pub fn start(app: AppHandle, mode: Mode, cleanup: bool) -> anyhow::Result<Started> {
     let mut cfg = Config::from_env()?;
     // Prefer a bundled sidecar binary shipped next to the app executable
     // (packaged build) unless the dev env vars pin python/script explicitly.
@@ -152,6 +153,15 @@ pub fn start(app: AppHandle, mode: Mode) -> anyhow::Result<Started> {
         }
     };
 
+    // Downstream filler/grammar cleanup. Best-effort and lazily loaded: it warms
+    // on hotkey press and unloads when idle, so it costs no resident RAM between
+    // dictations. Skipped for MATALU_NO_CLEANUP and for demo mode (which exists
+    // to exercise the UI without a mic or a model), both of which fall back to
+    // the raw live-partial path.
+    let no_cleanup =
+        std::env::var("MATALU_NO_CLEANUP").is_ok() || std::env::var("MATALU_DEMO").is_ok();
+    let cleaner = if no_cleanup { None } else { Some(Cleaner::new()) };
+
     // Session owns the listening state and the audio gate mode (starts Idle =
     // feed nothing, so the sidecar idles until the first dictation).
     let gate_mode = Arc::new(AtomicU8::new(gate::NONE));
@@ -159,6 +169,8 @@ pub fn start(app: AppHandle, mode: Mode) -> anyhow::Result<Started> {
     let session = Session::new(
         app.clone(),
         inject,
+        cleaner,
+        cleanup,
         gate_mode.clone(),
         recorder.clone(),
         mode,
@@ -181,7 +193,7 @@ pub fn start(app: AppHandle, mode: Mode) -> anyhow::Result<Started> {
     // capture --(gate)--> sidecar. Both legs bounded + lossy (drop, never block).
     let (capture_tx, capture_rx) = crossbeam_channel::bounded::<Vec<f32>>(64);
     let (sidecar_tx, sidecar_rx) = crossbeam_channel::bounded::<Vec<f32>>(64);
-    spawn_audio_gate(capture_rx, sidecar_tx, gate_mode, recorder);
+    spawn_audio_gate(capture_rx, sidecar_tx, gate_mode, recorder, silence_ms);
 
     let corrector = Arc::new(PassThrough);
     let sc = sidecar::spawn(cfg, sidecar_rx, events_tx, corrector)?;
@@ -219,16 +231,25 @@ fn bundled_sidecar_path() -> Option<std::path::PathBuf> {
     candidate.exists().then_some(candidate)
 }
 
+/// The sidecar consumes audio in 0.5 s units (`CHUNK = SR // 2`), so its VAD
+/// counts silence in 500 ms steps.
+const SIDECAR_STEP_MS: u64 = 500;
+
 /// Forward mic buffers to the sidecar according to the session's [`gate`] mode:
 /// [`gate::REAL`] passes mic audio, [`gate::SILENCE`] substitutes a same-length
 /// silent buffer (so the sidecar's VAD flushes a trailing `final`), and
 /// [`gate::NONE`] forwards *nothing* — the sidecar's blocking read parks and it
 /// stops inferring between dictations. Lossy like the capture callback.
+///
+/// On entering [`gate::SILENCE`] the drain silence is **burst** rather than paced
+/// at mic cadence — see [`burst_drain_silence`]. That is the single biggest term
+/// in the post-release wait: measured 2017 ms paced vs 407 ms burst.
 fn spawn_audio_gate(
     capture_rx: crossbeam_channel::Receiver<Vec<f32>>,
     sidecar_tx: crossbeam_channel::Sender<Vec<f32>>,
     gate_mode: Arc<AtomicU8>,
     recorder: Arc<MeetingRecorder>,
+    silence_ms: u64,
 ) {
     std::thread::Builder::new()
         .name("audio-gate".into())
@@ -245,7 +266,17 @@ fn spawn_audio_gate(
                             real_samples = 0;
                             peak = 0.0;
                         }
-                        gate::SILENCE => tracing::debug!("gate: forwarding silence (draining)"),
+                        gate::SILENCE => {
+                            tracing::debug!("gate: draining (bursting silence)");
+                            // `buf` was captured before the flip — it is part of
+                            // the user's last words, so it goes through as real
+                            // audio ahead of the burst.
+                            recorder.write(&buf);
+                            let _ = sidecar_tx.try_send(buf);
+                            burst_drain_silence(&capture_rx, &sidecar_tx, &recorder, silence_ms);
+                            prev = mode;
+                            continue;
+                        }
                         _ => tracing::debug!("gate: idle (forwarding nothing)"),
                     }
                     prev = mode;
@@ -267,14 +298,69 @@ fn spawn_audio_gate(
                         recorder.write(&buf);
                         buf
                     }
-                    gate::SILENCE => vec![0.0f32; buf.len()], // silence, same cadence
-                    _ => continue,                            // NONE: drop, feed nothing
+                    // The burst above already crossed the VAD threshold; this
+                    // just keeps the cadence until the session leaves Draining,
+                    // and covers a burst buffer the lossy channel dropped.
+                    gate::SILENCE => vec![0.0f32; buf.len()],
+                    _ => continue, // NONE: drop, feed nothing
                 };
                 let _ = sidecar_tx.try_send(out);
             }
             tracing::info!("audio gate: capture channel closed");
         })
         .expect("spawn audio-gate thread");
+}
+
+/// Number of zero samples to burst so the sidecar's VAD crosses `SILENCE_MS`.
+/// It counts in [`SIDECAR_STEP_MS`] steps and fires at `>=`, so this is the
+/// steps needed plus one for the partially-filled step at the boundary.
+fn drain_burst_samples(silence_ms: u64) -> usize {
+    let steps = silence_ms.div_ceil(SIDECAR_STEP_MS) + 1;
+    (steps * SIDECAR_STEP_MS * TARGET_SAMPLE_RATE as u64 / 1000) as usize
+}
+
+/// Push the whole drain silence at once instead of pacing it at mic cadence.
+///
+/// Pacing silence in real time is an artifact of reusing the capture loop, not a
+/// requirement: Parakeet's streaming decode is sample-driven, not clock-driven,
+/// so the same zeros delivered faster yield the same transcript — this is an
+/// exact optimization, not a heuristic. Measured 2017 ms → 407 ms from release to
+/// the trailing `final`.
+///
+/// **Ordering matters and is the whole risk here.** Buffers still sitting in
+/// `capture_rx` when the gate flipped were captured *before* release — they are
+/// the user's last words. Bursting silence ahead of them would reorder the
+/// stream, so the VAD would finalize early and those words would be lost (the
+/// gate goes `NONE` moments later) or split into the next utterance. So the
+/// queue is flushed as real audio first.
+fn burst_drain_silence(
+    capture_rx: &crossbeam_channel::Receiver<Vec<f32>>,
+    sidecar_tx: &crossbeam_channel::Sender<Vec<f32>>,
+    recorder: &MeetingRecorder,
+    silence_ms: u64,
+) {
+    let mut flushed = 0usize;
+    while let Ok(pending) = capture_rx.try_recv() {
+        flushed += pending.len();
+        recorder.write(&pending);
+        let _ = sidecar_tx.try_send(pending);
+    }
+
+    // One buffer per sidecar step, so a dropped `try_send` costs only one step.
+    let total = drain_burst_samples(silence_ms);
+    let per_step = (SIDECAR_STEP_MS * TARGET_SAMPLE_RATE as u64 / 1000) as usize;
+    let mut sent = 0usize;
+    while sent < total {
+        let n = per_step.min(total - sent);
+        if sidecar_tx.try_send(vec![0.0f32; n]).is_err() {
+            // Never block the gate. The paced silence path still runs after
+            // this, so the VAD flushes anyway — just at the old speed.
+            tracing::warn!(sent, total, "drain burst truncated; sidecar queue full");
+            break;
+        }
+        sent += n;
+    }
+    tracing::debug!(flushed_real = flushed, silence = sent, "gate: drain burst");
 }
 
 /// Subscribe to the transcript broadcast; route each event through the session
@@ -305,6 +391,112 @@ fn forward(app: AppHandle, mut rx: broadcast::Receiver<TranscriptEvent>, session
         }
         tracing::info!("transcript broadcast closed; forwarder stopping");
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mirrors the sidecar's VAD: it accumulates `SIDECAR_STEP_MS` per whole
+    /// chunk read and finalizes at `silence_ms >= SILENCE_MS`. The burst must
+    /// carry enough samples to reach that, or the drain silently falls back to
+    /// the slow paced path.
+    fn steps_until_final(burst_samples: usize, silence_ms: u64) -> Option<u64> {
+        let per_step = (SIDECAR_STEP_MS * TARGET_SAMPLE_RATE as u64 / 1000) as usize;
+        let mut accumulated = 0u64;
+        for step in 1..=(burst_samples / per_step) as u64 {
+            accumulated += SIDECAR_STEP_MS;
+            if accumulated >= silence_ms {
+                return Some(step);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn burst_always_crosses_the_vad_threshold() {
+        for silence_ms in [200, 500, 700, 1000, 1500, 2000, 3000] {
+            let samples = drain_burst_samples(silence_ms);
+            assert!(
+                steps_until_final(samples, silence_ms).is_some(),
+                "burst of {samples} samples never finalizes at silence_ms={silence_ms}"
+            );
+        }
+    }
+
+    #[test]
+    fn burst_does_not_massively_overshoot() {
+        // One spare step of headroom past the threshold, no more — every extra
+        // step is a full chunk of wasted inference on the critical path.
+        for silence_ms in [500, 700, 1000] {
+            let samples = drain_burst_samples(silence_ms);
+            let step = steps_until_final(samples, silence_ms).unwrap();
+            let per_step = (SIDECAR_STEP_MS * TARGET_SAMPLE_RATE as u64 / 1000) as usize;
+            let sent_steps = (samples / per_step) as u64;
+            assert_eq!(sent_steps, step + 1, "silence_ms={silence_ms}");
+        }
+    }
+
+    #[test]
+    fn default_silence_bursts_1500ms() {
+        // 700 ms threshold -> 2 steps to cross, +1 spare = 1.5 s @ 16 kHz.
+        assert_eq!(drain_burst_samples(700), 24_000);
+    }
+
+    /// The correctness risk of bursting: audio already queued when the gate
+    /// flips was captured *before* release and is the user's last words. If
+    /// silence jumped ahead of it the VAD would finalize early and those words
+    /// would be lost — the gate goes NONE moments later.
+    #[test]
+    fn queued_real_audio_is_flushed_before_the_silence_burst() {
+        let (cap_tx, cap_rx) = crossbeam_channel::bounded::<Vec<f32>>(64);
+        let (side_tx, side_rx) = crossbeam_channel::bounded::<Vec<f32>>(64);
+        let recorder = MeetingRecorder::new();
+
+        // Two buffers of real speech still in flight at the moment of release.
+        cap_tx.send(vec![0.5f32; 100]).unwrap();
+        cap_tx.send(vec![-0.5f32; 100]).unwrap();
+
+        burst_drain_silence(&cap_rx, &side_tx, &recorder, 700);
+        drop(side_tx);
+
+        let forwarded: Vec<Vec<f32>> = side_rx.iter().collect();
+        let real: Vec<&Vec<f32>> =
+            forwarded.iter().filter(|b| b.iter().any(|s| *s != 0.0)).collect();
+        assert_eq!(real.len(), 2, "both queued speech buffers must be forwarded");
+
+        let first_silence = forwarded.iter().position(|b| b.iter().all(|s| *s == 0.0)).unwrap();
+        let last_real = forwarded.iter().rposition(|b| b.iter().any(|s| *s != 0.0)).unwrap();
+        assert!(
+            last_real < first_silence,
+            "silence at index {first_silence} jumped ahead of real audio at {last_real}"
+        );
+
+        let silence: usize =
+            forwarded[first_silence..].iter().map(|b| b.len()).sum();
+        assert_eq!(silence, drain_burst_samples(700));
+    }
+
+    #[test]
+    fn burst_with_nothing_queued_sends_only_silence() {
+        let (_cap_tx, cap_rx) = crossbeam_channel::bounded::<Vec<f32>>(64);
+        let (side_tx, side_rx) = crossbeam_channel::bounded::<Vec<f32>>(64);
+        burst_drain_silence(&cap_rx, &side_tx, &MeetingRecorder::new(), 700);
+        drop(side_tx);
+        let forwarded: Vec<Vec<f32>> = side_rx.iter().collect();
+        assert!(forwarded.iter().all(|b| b.iter().all(|s| *s == 0.0)));
+        assert_eq!(forwarded.iter().map(|b| b.len()).sum::<usize>(), 24_000);
+    }
+
+    /// The gate must never block, so a full downstream queue truncates the
+    /// burst rather than waiting. The paced silence path then still flushes.
+    #[test]
+    fn full_sidecar_queue_truncates_instead_of_blocking() {
+        let (_cap_tx, cap_rx) = crossbeam_channel::bounded::<Vec<f32>>(64);
+        let (side_tx, side_rx) = crossbeam_channel::bounded::<Vec<f32>>(1);
+        burst_drain_silence(&cap_rx, &side_tx, &MeetingRecorder::new(), 700);
+        assert_eq!(side_rx.len(), 1, "should have stopped at the queue limit");
+    }
 }
 
 /// Emit a looping synthetic utterance so the pipeline can be exercised without

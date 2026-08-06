@@ -50,6 +50,12 @@
   </section>
 
   <section>
+    <h2>Cleanup</h2>
+    <label class="row"><input type="checkbox" id="cleanup"> Clean up filler words and grammar</label>
+    <div class="hint">Removes “um”, stutters, and false starts, and fixes punctuation. Your wording is kept as spoken — nothing is reworded or summarised, and if the cleanup fails the raw text is used. While this is on, text appears when you release the hotkey rather than as you speak, so the whole sentence can be corrected at once.</div>
+  </section>
+
+  <section>
     <h2>Permissions</h2>
     <div class="perm">
       <span>Accessibility (required to type into apps):</span>
@@ -73,6 +79,7 @@
       const s = await invoke('get_settings');
       document.querySelector(`input[name="mode"][value="${s.activation_mode}"]`).checked = true;
       document.getElementById('hotkey').value = s.hotkey;
+      document.getElementById('cleanup').checked = s.cleanup;
     }
 
     async function refreshPerms() {
@@ -85,8 +92,9 @@
     document.getElementById('save').addEventListener('click', async () => {
       const mode = document.querySelector('input[name="mode"]:checked').value;
       const hotkey = document.getElementById('hotkey').value;
+      const cleanup = document.getElementById('cleanup').checked;
       try {
-        await invoke('set_settings', { settings: { activation_mode: mode, hotkey } });
+        await invoke('set_settings', { settings: { activation_mode: mode, hotkey, cleanup } });
         const el = document.getElementById('saved');
         el.classList.add('show');
         setTimeout(() => el.classList.remove('show'), 1500);

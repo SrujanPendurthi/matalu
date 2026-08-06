@@ -60,6 +60,17 @@ impl HotkeyPreset {
 pub struct Settings {
     pub activation_mode: ActivationMode,
     pub hotkey: HotkeyPreset,
+    /// Run the downstream cleanup model over each dictation (removes fillers and
+    /// false starts, fixes grammar). On means nothing types until you release —
+    /// the whole utterance is cleaned with full context and pasted at once. Off
+    /// restores live raw typing. Defaults on for settings files written before
+    /// this existed.
+    #[serde(default = "default_cleanup")]
+    pub cleanup: bool,
+}
+
+fn default_cleanup() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -67,6 +78,7 @@ impl Default for Settings {
         Self {
             activation_mode: ActivationMode::PushToTalk,
             hotkey: HotkeyPreset::AltSpace,
+            cleanup: default_cleanup(),
         }
     }
 }
