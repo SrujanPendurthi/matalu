@@ -20,3 +20,9 @@ __pycache__/
 # Test/scratch audio
 *.wav
 *.aiff
+
+# QLoRA training set — derived from DisfluencySpeech, rebuild with
+# `python3 training/build_dataset.py` (7 MB, no reason to version it).
+/training/data/
+# Trained adapters: build artifacts of `mlx_lm.lora`, not source.
+/sidecar/adapters/
