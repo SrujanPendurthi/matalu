@@ -185,7 +185,14 @@ impl Cleaner {
         });
         // Base budget; the per-request timeout adds TIMEOUT_PER_CHAR per input char.
         let timeout = Duration::from_millis(env_ms("MATALU_CLEAN_TIMEOUT_MS", 2_000));
-        let idle = Duration::from_millis(env_ms("MATALU_CLEAN_IDLE_MS", 180_000));
+        // 30 min, not 3. Cold start is ~5.5 s (model load + the two self-checks),
+        // and `clean()` does not wait — it returns None and the caller pastes raw.
+        // A 3-minute timeout therefore meant the first dictation after any short
+        // break silently lost cleanup unless the user happened to speak for 5.5 s,
+        // and short dictations are the common case. Cleanup is worth 76% of the
+        // achievable improvement; trading that away every session to reclaim
+        // 860 MB a few minutes sooner is a bad deal.
+        let idle = Duration::from_millis(env_ms("MATALU_CLEAN_IDLE_MS", 1_800_000));
 
         let me = std::sync::Arc::new(Self {
             live: Mutex::new(None),
@@ -272,7 +279,13 @@ impl Cleaner {
             return None;
         }
         let mut guard = self.live.lock().unwrap();
-        let live = guard.as_mut()?;
+        let Some(live) = guard.as_mut() else {
+            // Distinct from a guard rejection: the model simply is not up yet.
+            // Silent here would be indistinguishable from "cleanup ran and was
+            // rejected", and the two want opposite fixes.
+            tracing::warn!("cleanup sidecar not warm yet; pasting raw text");
+            return None;
+        };
 
         let request = serde_json::json!({ "text": raw }).to_string();
         if writeln!(live.stdin, "{request}").and_then(|_| live.stdin.flush()).is_err() {

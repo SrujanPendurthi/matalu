@@ -154,8 +154,15 @@ impl Session {
 
     /// Mark the pipeline ready (sidecar warm + mic capturing). Until this is
     /// called, activation is ignored so the "listening" indicator can't lie.
-    pub fn mark_ready(&self) {
+    pub fn mark_ready(self: &Arc<Self>) {
         self.ready.store(true, Ordering::Relaxed);
+        // Start loading the cleanup model now rather than on the first hotkey
+        // press. Cold start is ~5.5 s and `Cleaner::clean` does not wait, so
+        // warming only on press means the *first* dictation of the app's life
+        // silently skips cleanup unless it happens to run longer than the load.
+        if let Some(c) = &self.cleaner {
+            c.warm();
+        }
         let _ = self
             .app
             .emit(STATUS_EVENT, serde_json::json!({ "listening": false, "state": "ready" }));
