@@ -8,14 +8,12 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use crossbeam_channel::Receiver;
 use tokio::sync::broadcast;
 
 use crate::config::Config;
-use crate::corrector::Corrector;
 use crate::events::TranscriptEvent;
 
 /// Handle returned by [`spawn`]: the child process plus a one-shot receiver
@@ -31,7 +29,6 @@ pub fn spawn(
     cfg: Config,
     audio_rx: Receiver<Vec<f32>>,
     events_tx: broadcast::Sender<TranscriptEvent>,
-    corrector: Arc<dyn Corrector>,
 ) -> Result<Sidecar> {
     // Either run a self-contained bundled executable directly, or launch the
     // Python script via the interpreter (dev). Same protocol either way.
@@ -88,7 +85,7 @@ pub fn spawn(
         })
         .expect("spawn sidecar-writer");
 
-    // Reader: child stdout (newline JSON) → ready signal | corrector → broadcast.
+    // Reader: child stdout (newline JSON) → ready signal | event → broadcast.
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
     std::thread::Builder::new()
         .name("sidecar-reader".into())
@@ -118,8 +115,7 @@ pub fn spawn(
                 }
                 match serde_json::from_str::<TranscriptEvent>(&line) {
                     Ok(ev) => {
-                        let refined = corrector.refine(ev.text());
-                        let _ = events_tx.send(ev.with_text(refined));
+                        let _ = events_tx.send(ev);
                     }
                     Err(e) => tracing::warn!(error = %e, line = %line, "unparseable sidecar output"),
                 }

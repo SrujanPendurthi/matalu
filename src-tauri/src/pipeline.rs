@@ -12,7 +12,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use matalu::config::{Config, TARGET_SAMPLE_RATE};
-use matalu::corrector::PassThrough;
 use matalu::events::TranscriptEvent;
 use matalu::{audio, sidecar};
 use tauri::{AppHandle, Emitter};
@@ -114,7 +113,7 @@ pub struct Started {
 /// Start the pipeline and return the [`Session`] + sidecar child. `mode` is the
 /// initial activation mode (from persisted settings / env override).
 pub fn start(app: AppHandle, mode: Mode, cleanup: bool) -> anyhow::Result<Started> {
-    let mut cfg = Config::from_env()?;
+    let mut cfg = Config::from_env();
     // Prefer a bundled sidecar binary shipped next to the app executable
     // (packaged build) unless the dev env vars pin python/script explicitly.
     if cfg.sidecar_bin.is_none() && std::env::var_os("MATALU_SIDECAR").is_none() {
@@ -195,8 +194,7 @@ pub fn start(app: AppHandle, mode: Mode, cleanup: bool) -> anyhow::Result<Starte
     let (sidecar_tx, sidecar_rx) = crossbeam_channel::bounded::<Vec<f32>>(64);
     spawn_audio_gate(capture_rx, sidecar_tx, gate_mode, recorder, silence_ms);
 
-    let corrector = Arc::new(PassThrough);
-    let sc = sidecar::spawn(cfg, sidecar_rx, events_tx, corrector)?;
+    let sc = sidecar::spawn(cfg, sidecar_rx, events_tx)?;
     let sidecar_ready = sc.ready;
 
     // Gate mic capture on sidecar readiness (model load/warm), bounded, off the

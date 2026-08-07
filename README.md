@@ -1,115 +1,91 @@
 # matalu
 
-Local, real-time speech-to-text **service** for Apple Silicon. Captures your
-microphone, transcribes on-device with NVIDIA **Parakeet** via Apple's **MLX**
-framework (GPU/ANE-accelerated), and streams `partial`/`final` transcripts over
-a local **WebSocket**.
+Local, real-time dictation for Apple Silicon. Hold a hotkey, speak, release —
+cleaned text is typed into whatever app has focus. Nothing leaves the machine.
 
-Rust owns capture, resampling, transport, and the WebSocket server; the MLX model
-(Python-only) runs in a supervised **sidecar** process. Punctuation and casing
-come from the model itself. Text passes through a pluggable
-[`Corrector`](src/corrector.rs) seam — a no-op today, the drop-in point for a
-context-aware grammar/formatting LLM later.
+Two on-device models via Apple **MLX**:
+
+| | | |
+|---|---|---|
+| **Parakeet TDT 0.6B** | 8-bit | audio → verbatim text |
+| **Qwen2.5-1.5B-Instruct** | 4-bit + QLoRA adapter | verbatim → cleaned text |
+
+The cleanup stage removes fillers, stutters, and false starts — "so um I think
+we should uh ship it Tuesday, no wait, Thursday" becomes "So, I think we should
+ship it on Thursday." It is **deletion-only**: it never paraphrases, and if the
+model's output isn't drawn from your words it is rejected and the raw
+transcript is used instead.
 
 ## Architecture
 
+Rust owns capture, resampling, injection, and process supervision. MLX is
+Python-only, so each model runs in its own supervised sidecar over pipes.
+
 ```
- cpal mic thread          Rust process                    Python sidecar
- ───────────────         ──────────────                  ────────────────
- device callback ─f32─▶  resample→16k mono ─raw f32──▶   parakeet-mlx streaming
- (48 kHz native)         (own thread)      (child stdin)  + RMS VAD segmentation
-                                                          │  JSON lines (stdout)
-                          TranscriptEvent ◀───────────────┘
-                          (corrector) → tokio broadcast ─▶ WebSocket clients
+ cpal mic          Rust                     Python sidecars
+ ────────         ──────                   ─────────────────
+ 48 kHz  ─f32─▶  resample → 16k ─raw f32─▶ parakeet-mlx  (partials stream,
+                 audio gate                              finals decoded at
+                                            │             full context)
+                 TranscriptEvent  ◀──JSON───┘
+                        │
+                 buffer whole utterance
+                        │
+                        └─────────text──────▶ Qwen + LoRA (cleanup)
+                                   ◀──────────
+                 guards → clipboard + CGEvent paste
 ```
 
-- **Audio** (`src/audio.rs`): cpal capture, downmix to mono, streaming resample
-  to 16 kHz, on its own thread (a mic-permission stall never blocks the server).
-- **Sidecar** (`src/sidecar.rs` + `sidecar/matalu_sidecar.py`): Rust spawns the
-  Python process and bridges two pipes — audio in (raw f32), JSON events out. The
-  Python side runs `parakeet-mlx` streaming and an RMS silence VAD, emitting
-  `partial` frames live and a `final` after ~700 ms of quiet.
-- **Server** (`src/server.rs`): `axum` WebSocket at `/ws`, `broadcast` fan-out;
-  `/health` for liveness.
+**Nothing types while you speak.** The whole press→release window is buffered
+and cleaned once, which is what lets a self-correction spanning two sentences
+be fixed at all — you can't repair "Tuesday" after it's already typed.
+
+- `crates/core/` — mic capture, resampling, sidecar supervision, `TranscriptEvent`s
+- `src-tauri/` — Tauri v2 app: hotkey, session state machine, cleanup, injection, tray, pill
+- `sidecar/` — the two Python sidecars plus post-hoc diarization
+- `training/` — QLoRA dataset build, training config, and the eval harnesses
 
 ## Setup
 
-Requires Rust, Python 3, and macOS (Apple Silicon).
+Requires Rust, Python 3, and macOS on Apple Silicon.
 
 ```bash
-# 1. Python deps (parakeet-mlx pulls in mlx). A venv is recommended:
-python3 -m pip install parakeet-mlx
-
-# 2. Build
-cargo build --release
+python3 -m pip install parakeet-mlx mlx-lm
+cargo tauri dev
 ```
 
-The MLX model (`mlx-community/parakeet-tdt-0.6b-v2`, ~1.2 GB) is downloaded and
-cached automatically by the sidecar on first run.
+Models (~2 GB total) download and cache on first run. Grant **Microphone** and
+**Accessibility** permission — the latter is what allows typing into other apps.
 
-## Run
+The app is menu-bar only: no dock icon. A floating pill appears while dictating;
+the transcript window is reachable from the tray.
 
-```bash
-cargo run --release
-# → starting parakeet-mlx sidecar ...
-# → WebSocket server listening (connect to ws://127.0.0.1:8765/ws)
-```
+## Quality
 
-Grant **microphone permission** to your terminal on first run
-(System Settings → Privacy & Security → Microphone).
+Measured, not estimated. `training/eval_pipeline.py` and `training/eval_adapter.py`
+reproduce these.
 
-Consume the stream:
+| | |
+|---|---|
+| ASR, LibriSpeech test-clean | **1.49% WER** (published: 1.69%) |
+| Cleanup, 250 held-out pairs | **3.27% WER** vs 13.67% doing nothing |
+| Disfluencies removed | 54.4% |
+| Content words preserved | 99.3% |
+| Post-release latency | ~510 ms |
 
-```bash
-# with websocat (brew install websocat):
-websocat ws://127.0.0.1:8765/ws
+The cleanup model is fine-tuned on
+[DisfluencySpeech](https://huggingface.co/datasets/amaai-lab/DisfluencySpeech)
+(`transcript_a` → `transcript_c`). The adapter is committed; without it the app
+silently falls back to a much weaker base model, so check the sidecar's startup
+log for `system prompt: short (tuned)`.
 
-# or Python (pip install websockets):
-python3 -c '
-import asyncio, websockets
-async def main():
-    async with websockets.connect("ws://127.0.0.1:8765/ws") as ws:
-        while True:
-            print(await ws.recv())
-asyncio.run(main())'
-```
+## Also included
 
-Frames:
+- **Meeting transcription** (tray → Start Meeting) — continuous capture via an
+  Aggregate Device (mic + BlackHole loopback), with post-hoc speaker diarization
+  through sherpa-onnx. Best-effort: no models, no labels, transcript still works.
+- **`MATALU_CLEANUP_LOG=<path>`** — appends `{raw, cleaned}` pairs per dictation,
+  for fine-tuning on your own voice rather than a public corpus.
 
-```json
-{ "type": "partial", "text": "hello wor",     "ts_ms": 1200 }
-{ "type": "final",   "text": "Hello, world.", "ts_ms": 1600 }
-```
-
-### Configuration (env vars)
-
-| Var | Default | Meaning |
-|-----|---------|---------|
-| `MATALU_BIND` | `127.0.0.1:8765` | Server bind address |
-| `MATALU_PYTHON` | `python3` | Interpreter that runs the sidecar |
-| `MATALU_SIDECAR` | `sidecar/matalu_sidecar.py` | Sidecar script path |
-| `MATALU_MLX_MODEL` | `mlx-community/parakeet-tdt-0.6b-v2` | HF id or local path |
-| `MATALU_SILENCE_MS` | `700` | Silence (ms) that finalizes an utterance |
-| `MATALU_VAD_RMS` | `0.010` | RMS threshold for speech vs silence |
-| `MATALU_DEMO` | _(unset)_ | If set, emit synthetic events (no mic/model needed) |
-
-## Testing
-
-```bash
-# WebSocket protocol end-to-end, synthetic events (no mic/model):
-MATALU_DEMO=1 cargo run
-
-# Sidecar streaming smoke test on a 16 kHz WAV:
-python3 sidecar/test_stream.py some_audio_16k.wav
-
-# Resampler unit tests:
-cargo test
-```
-
-## Roadmap
-
-- **Grammar/formatting LLM**: implement `Corrector` (e.g. `OllamaCorrector` →
-  `localhost:11434`, or in-process `llama.cpp`) for context-aware cleanup on
-  finalized utterances or a rolling window.
-- **Latency tuning**: adjust the streaming `context_size` / chunk granularity in
-  the sidecar for lower latency vs accuracy.
+Configuration is env-var only; see `CLAUDE.md` for the full list and for the
+measured reasoning behind the defaults.

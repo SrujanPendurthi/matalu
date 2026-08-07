@@ -15,18 +15,3 @@ pub enum TranscriptEvent {
     Final { text: String, ts_ms: u64 },
 }
 
-impl TranscriptEvent {
-    /// Return a copy with `text` replaced (used to apply the corrector).
-    pub fn with_text(&self, text: String) -> Self {
-        match self {
-            TranscriptEvent::Partial { ts_ms, .. } => TranscriptEvent::Partial { text, ts_ms: *ts_ms },
-            TranscriptEvent::Final { ts_ms, .. } => TranscriptEvent::Final { text, ts_ms: *ts_ms },
-        }
-    }
-
-    pub fn text(&self) -> &str {
-        match self {
-            TranscriptEvent::Partial { text, .. } | TranscriptEvent::Final { text, .. } => text,
-        }
-    }
-}
