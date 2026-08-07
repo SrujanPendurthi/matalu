@@ -24,5 +24,8 @@ __pycache__/
 # QLoRA training set — derived from DisfluencySpeech, rebuild with
 # `python3 training/build_dataset.py` (7 MB, no reason to version it).
 /training/data/
-# Trained adapters: build artifacts of `mlx_lm.lora`, not source.
-/sidecar/adapters/
+# The trained cleanup adapter IS committed (21 MB): without it the app silently
+# falls back to the base model, which captures 12.6% of the achievable cleanup
+# instead of 76.1%. Too load-bearing to leave out of a clone.
+# Intermediate checkpoints are not — they duplicate adapters.safetensors.
+/sidecar/adapters/**/[0-9]*_adapters.safetensors
