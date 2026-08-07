@@ -14,9 +14,8 @@ fine_tune_type: lora
 data: "training/data"
 adapter_path: "sidecar/adapters/cleanup"   # picked up automatically by clean_sidecar.py
 
-# Loss on the assistant turn only. Without this, ~75% of every sequence is the
-# 1107-char system prompt, and the model would spend its capacity learning to
-# reproduce our own instructions.
+# Loss on the assistant turn only, so capacity goes to the transform rather than
+# to reproducing the prompt.
 mask_prompt: true
 
 # 4500 train pairs / batch 4 = ~1125 steps per epoch, so this is ~1 epoch.
@@ -32,9 +31,11 @@ lora_parameters:
   dropout: 0.0
   scale: 20.0
 
-# Utterances are short (~30 tokens) but the system prompt is ~263, so sequences
-# land near 350. 1024 leaves headroom without padding waste.
-max_seq_length: 1024
+# Sequences are short: ~10-token prompt (TUNED_SYSTEM_PROMPT) + ~30 user +
+# ~30 assistant. Training on the full 263-token instruction block instead made
+# the run ~4x slower for no benefit — the labels are the supervision, not the
+# instructions. See TUNED_SYSTEM_PROMPT in sidecar/clean_sidecar.py.
+max_seq_length: 512
 
 steps_per_report: 25
 steps_per_eval: 100

@@ -29,12 +29,18 @@ OUT_DIR = os.path.join(REPO_ROOT, "training", "data")
 
 
 def system_prompt() -> str:
-    """The live prompt from the sidecar — never a copy that can drift."""
+    """The live prompt from the sidecar — never a copy that can drift.
+
+    `TUNED_SYSTEM_PROMPT`, not `SYSTEM_PROMPT`: the sidecar switches to the short
+    prompt whenever an adapter is loaded, so that is the prompt this adapter will
+    actually see at inference. Training on the long one would teach the model a
+    context it never gets.
+    """
     path = os.path.join(REPO_ROOT, "sidecar", "clean_sidecar.py")
     spec = importlib.util.spec_from_file_location("clean_sidecar", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod.SYSTEM_PROMPT
+    return mod.TUNED_SYSTEM_PROMPT
 
 
 def build(split, prompt, seen):
