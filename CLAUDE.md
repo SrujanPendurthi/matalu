@@ -4,7 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`matalu` is a local, real-time speech-to-text system for Apple Silicon. It captures the mic and transcribes on-device with NVIDIA **Parakeet** via Apple **MLX** (Python-only, run in a supervised **sidecar** process); Rust owns capture, resampling, and everything downstream. The project is a **Cargo workspace** with two frontends over one shared core:
+`matalu` is a local, real-time speech-to-text system for Apple Silicon. It captures the mic and transcribes on-device with NVIDIA **Parakeet**, then cleans the transcript (fillers, stutters, false starts) with a QLoRA-tuned **Qwen2.5-1.5B**. Both run via Apple **MLX** — Python-only, so each lives in its own supervised **sidecar** process while Rust owns capture, resampling, and everything downstream.
+
+**Two models, deliberately at different precisions:** Parakeet 0.6B at 8-bit, Qwen 1.5B at 4-bit + adapter. ASR errors go straight into WER; a constrained deletion task has slack. Neither is fine-tuned except the cleanup adapter, and they are not merged (see the end-to-end note under conventions).
+
+The project is a **Cargo workspace** with two frontends over one shared core:
 
 - **`matalu-app`** (`src-tauri/`) — the primary goal: a Wispr-Flow-style **Tauri desktop app** that types transcripts into whatever app has focus (global hotkey + system-wide text injection). Under active construction; see the plan at `~/.claude/plans/rippling-leaping-moonbeam.md`.
 - **`matalu-headless`** (`crates/headless/`) — the original headless **WebSocket service** (`/ws` + browser viewer at `/`), kept as a dev/debug harness for the pipeline.
@@ -15,6 +19,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 cargo build                              # build the whole workspace
 cargo build -p matalu-app                # build just the desktop app
+cargo test --workspace                   # 30 tests: 28 app + 2 core
 cargo test -p matalu                     # core unit tests (LinearResampler, crates/core/src/audio.rs)
 cargo test -p matalu streaming_matches_one_shot   # a single test by name
 
@@ -28,6 +33,13 @@ python3 sidecar/test_stream.py some_audio_16k.wav # sidecar streaming smoke test
 python3 sidecar/clean_sidecar.py --selftest      # cleanup sidecar's pure text handling (no model)
 echo '{"text":"so um i think we should uh ship it"}' | python3 sidecar/clean_sidecar.py  # cleanup smoke test
 cargo test -p matalu-app -- --ignored --nocapture # cleanup integration: real sidecar spawn + timeout fallback
+
+# Quality measurement (training/). These are how any model/decoding change is judged.
+python3 training/eval_pipeline.py        # ASR alone / cleanup alone / end-to-end, vs DisfluencySpeech ground truth
+python3 training/eval_adapter.py         # base vs adapter on 250 held-out pairs, through the real sidecar
+N_UTTS=50 python3 training/eval_pipeline.py       # quicker pass
+python3 training/build_dataset.py        # rebuild training/data from DisfluencySpeech
+python3 -m mlx_lm lora --train -c training/lora_config.yaml   # retrain the adapter (~10 min; stops early)
 
 sidecar/build_sidecar.sh                 # PyInstaller-build the self-contained sidecar → src-tauri/binaries/ (before `cargo tauri build`)
 sidecar/dump_and_analyze.sh              # dictation-accuracy diagnostic: run app w/ audio dump, dictate, quit → level/SNR stats + offline transcription
@@ -59,7 +71,7 @@ cpal mic (48 kHz) → resample→16k mono → Python parakeet-mlx sidecar → br
 - **`crates/headless/`** (`matalu-headless`): `main.rs` wires the pipeline to `server.rs` — `axum` `/ws` (per-client broadcast subscription), `/health`, and `/` (serves `index.html` via `include_str!`).
 - **`src-tauri/`** (`matalu-app`): Tauri v2 shell. `lib.rs::run()` builds the app; `pipeline.rs::start()` spawns the core pipeline plus an **audio-gate** thread and routes each `TranscriptEvent` through the session to injection + UI (`app.emit("transcript", …)`). The gate is **3-state** (`pipeline::gate` — `REAL`/`SILENCE`/`NONE`): Listening forwards real mic audio, Draining forwards silence (so the sidecar's VAD flushes the trailing `final`), and Idle forwards **nothing** — the sidecar's blocking stdin read parks so it stops running inference between dictations (the "explicit start/stop" without a protocol change).
   - `session.rs` — activation state machine (Idle/Listening/Draining), gates the audio feed, drives injection. Not ready until the sidecar is warm + mic live (`mark_ready`), so the "listening" indicator can't lie.
-  - `injector.rs` — system-wide text injection: diff-based live partials (unit-tested `DiffState`) pasted via clipboard (`arboard`) + **CoreGraphics `CGEvent`** keystrokes. Do **not** use enigo here (see [[matalu-injection-coregraphics]]).
+  - `injector.rs` — system-wide text injection: diff-based live partials (unit-tested `DiffState`) pasted via clipboard (`arboard`) + **CoreGraphics `CGEvent`** keystrokes. Do **not** use enigo here — its Unicode path SIGTRAPs when called off the main thread.
   - `hotkey.rs` — global activation via `tauri-plugin-global-shortcut` (Pressed/Released → push-to-talk or toggle). The `fn` (Globe) preset can't be a plugin binding, so it's driven by `fnkey.rs` instead — a **CGEventTap** on its own thread + `CFRunLoop` that edge-detects the secondary-`fn` flag on `FlagsChanged` and calls the same `Session::on_press`/`on_release`. It's listen-only (fn passes through) and needs Accessibility/Input Monitoring; switching to/from `fn` in settings takes effect on the next launch (a run-loop tap can't be started mid-session).
   - `settings.rs` + `commands.rs` — persisted `Settings` (activation mode + hotkey preset) as JSON in the app config dir; Tauri commands for the settings window (`ui/settings.html`) and Accessibility onboarding.
   - `tray.rs` — menu-bar tray (Settings…, **Start/Stop Meeting Transcript**, Show/Hide, Quit). Frontend is static HTML/JS in `ui/` (no bundler; `withGlobalTauri` exposes `window.__TAURI__`).
@@ -84,7 +96,7 @@ cpal mic (48 kHz) → resample→16k mono → Python parakeet-mlx sidecar → br
   | base model | 11.95% | 21.8% | 96.7% | 4.8% |
   | **+ adapter** | **3.27%** | **54.4%** | **99.3%** | **0.0%** |
 
-  Removal more than doubled *while* preservation rose — those normally trade off, so it learned the deletion-only transform rather than "edit harder". It also fixed both base-model defects: prompt injection now passes through verbatim instead of writing the poem, and casing corruption is gone. Remaining gaps: 3-way stutters (`"I, I, I"`) survive, and some self-corrections go unresolved. Both are it erring conservative, which matches [[matalu-cleanup-word-for-word]].
+  Removal more than doubled *while* preservation rose — those normally trade off, so it learned the deletion-only transform rather than "edit harder". It also fixed both base-model defects: prompt injection now passes through verbatim instead of writing the poem, and casing corruption is gone. Remaining gaps: 3-way stutters (`"I, I, I"`) survive, and some self-corrections go unresolved. Both are it erring conservative, which is the requested direction — see the deletion-only convention below.
   **Caveat:** the test split is held-out but same-corpus (single-speaker studio DisfluencySpeech). Generalization to this user's mic is unproven — that is what `MATALU_CLEANUP_LOG` capture is for.
 - **Cleanup decoding uses prompt-lookup speculative decoding (`MATALU_CLEAN_NO_LOOKUP=1` disables).** The drafter copies the continuation of a matching n-gram straight out of the prompt — no second model, no extra memory — because cleanup is deletion-only so nearly every output token already appears in the input. **79% of drafted tokens are accepted**, and the measured win through the real sidecar is **1.74x (595 → 342 ms) with byte-identical output**.
   - **It is exact, and that is the entire justification.** A drafted token is kept only where it matches what the model would have produced anyway; the first mismatch is replaced by the model's own token. Verified against plain greedy on 45 utterances plus the held-out eval (2.84% WER, 77.0% capture — unchanged).
@@ -117,10 +129,9 @@ cpal mic (48 kHz) → resample→16k mono → Python parakeet-mlx sidecar → br
   - Any cached-path exception drops to the uncached path and rebuilds the cache. `MATALU_CLEAN_NO_CACHE=1` forces uncached.
   - This uses `stream_generate`, not `generate`, because trimming needs the generated-token count.
   - Because prefill is now nearly free, **shortening the system prompt buys almost no speed** — do it for clarity if at all, not for latency.
-- **The ASR model is quantized to 8-bit at load (`MATALU_ASR_BITS`, default 8; `0` = bf16).** `parakeet-mlx` loads bf16 and has no quantization of its own, so `matalu_sidecar.py::quantize_model` applies `nn.quantize` (MLX affine, group 64, weight-only) after `from_pretrained`. Measured on LibriSpeech test-clean (60 utts, streaming, context 128,128): **8-bit is strictly better than bf16 — same 10.32% WER, −383 MB, 1.39x RTF** (real drain 969 → 679 ms). 6-bit costs +1.19 WER, **4-bit costs +5.16 WER (+50% relative) and must not be used.**
+- **The ASR model is quantized to 8-bit at load (`MATALU_ASR_BITS`, default 8; `0` = bf16).** `parakeet-mlx` loads bf16 and has no quantization of its own, so `matalu_sidecar.py::quantize_model` applies `nn.quantize` (MLX affine, group 64, weight-only) after `from_pretrained`. Measured on LibriSpeech test-clean (60 utts, streaming): **8-bit is strictly better than bf16 — same WER, −383 MB, 1.39x RTF** (real drain 969 → 679 ms). 6-bit costs +1.19 WER, **4-bit costs +5.16 WER (+50% relative) and must not be used.** That sweep sampled **shortest-first**, which inflates every absolute WER ~2.5x, so only its *deltas* are quotable — the model's real numbers are in the streaming/full-context table below.
   - **`self_attn` linears must be skipped** (~120 of 220). `transcribe_stream()` swaps in a `rel_pos_local_attn` module and copies weights with `load_weights()`, which rejects the `scales`/`biases` a quantized Linear carries. Quantizing them raises `Received 10 parameters not in model`.
   - **This is aggregate-neutral, not output-identical** — unlike the prompt cache and the drain burst, individual transcripts *do* change; the justification is equal WER over a corpus, not an equal string. Any change to the model, bit width, or streaming context needs a fresh WER sweep, not a spot check: a single TTS sentence made 4-bit look like a punctuation difference when it was actually +50% relative WER.
-  - That sweep sampled **shortest-first**, which inflates WER ~2.5x (short clips carry less context). Its *relative* comparison holds — the same bias is in every row — but **do not quote 10.32% as this model's WER**; see below.
 - **Streaming costs ~4x WER, and it is the largest quality lever in the system.** Measured on a *random* 60-utterance LibriSpeech test-clean sample, 8-bit:
 
   | config | WER |
@@ -134,11 +145,21 @@ cpal mic (48 kHz) → resample→16k mono → Python parakeet-mlx sidecar → br
   - **It is faster, not slower, despite adding a decode.** Once the `final` no longer comes from the streaming result, the trailing silence no longer needs to go through the encoder — and that was the expensive half of the drain. Measured through the real sidecar: **353 → 169 ms (2.09x)**, and the output went from `'So am I. I think we should ship it on Tuesday. No wait. Thursday.'` to verbatim-correct `'So um I think we should ship it on Tuesday, no wait, Thursday.'`
   - **One chunk of pre-roll is buffered** because the VAD fires on RMS and a quiet word onset often begins in the *previous* chunk. Without it the decode clips the first syllable — the most likely way this breaks subtly.
   - The skip-silence behavior is gated on the **same** flag, so `MATALU_FULL_CONTEXT_FINAL=0` restores the old path exactly. Splitting them produces a third, worse path where the streaming final never gets its flush.
-  - Phase 1.6's burst drain still matters and still composes: the sidecar must *observe* silence chunks to detect the end of an utterance, it just no longer encodes them.
+  - The burst drain (below) still matters and still composes: the sidecar must *observe* silence chunks to detect the end of an utterance, it just no longer encodes them.
 - **The drain silence is burst, not paced — do not "fix" it back to mic cadence.** On release the gate switches to `gate::SILENCE`, and the sidecar needs `SILENCE_MS` of quiet (counted in 0.5 s chunks) before it emits the trailing `final` that starts cleanup. Feeding those zeros at *microphone cadence* made that wait real-time — measured **1509 ms**, larger than the cleanup itself. `burst_drain_silence` pushes the whole drain at once instead: **491 ms, transcript byte-identical** (Parakeet's streaming decode is sample-driven, not clock-driven, so the same zeros delivered faster decode the same). Two things to preserve:
   - **Queued real audio is flushed first.** Buffers still in `capture_rx` when the gate flips were captured *before* release — the user's last words. Silence jumping ahead of them makes the VAD finalize early and those words are lost (the gate goes `NONE` moments later) or split into the next utterance. Unit-tested (`queued_real_audio_is_flushed_before_the_silence_burst`).
   - Burst size comes from `Config::silence_ms`, never hardcoded, and `try_send` is kept throughout so a full queue truncates rather than blocking the gate — the paced silence path after it is the fallback.
-- **Do not try to merge the ASR and cleanup models.** Asked and rejected: SLERP interpolates weight tensors and needs identical architecture and shapes, and Parakeet (audio-in RNN-T/TDT conformer) shares no tensor correspondence with Qwen (text-in decoder-only). Merging also would not reduce latency even where possible — two N-param models merge into one N-param model with identical FLOPs/token. Merging combines capabilities, not speed. Remaining latency levers, in measured order of value: a smaller model, then speculative decoding (attacks only the ~200 ms decode slice, so it matters for the 600-char flush, not short utterances).
+- **The two models cannot be weight-merged, but a single end-to-end model is a live open question.** SLERP and friends need identical architecture and tensor shapes; Parakeet (audio-in RNN-T/TDT conformer) shares no correspondence with Qwen (text-in decoder-only), and merging two N-param models yields one N-param model anyway — it combines capabilities, not speed. What *would* pay is a **different** thing: one model trained audio → cleaned text, removing the whole second stage (~340 ms and ~860 MB).
+  The argument for it is the error decomposition (`training/eval_pipeline.py`, 200 DisfluencySpeech utts, current config):
+
+  | | WER |
+  |---|---|
+  | ASR alone (vs verbatim) | 4.37% |
+  | cleanup alone (perfect input) | 4.36% |
+  | **end-to-end** | **9.00%** |
+
+  4.37 + 4.36 ≈ 9.00 — **the two error sources compound almost additively**, and content preservation drops 98.8% → 95.0% between clean input and ASR input purely from the cleanup stage mishandling ASR errors. That cascade is structural to any two-stage design and no amount of tuning either stage removes it. A single model has one error source.
+  Costs that keep it unbuilt: it **destroys the guard architecture** (no raw transcript to check the output against, so word-for-word becomes unenforceable), `parakeet-mlx` is inference-only so it means Whisper+LoRA or NeMo+CUDA, and 9.00% is now a genuinely good bar to beat. `amaai-lab/DisfluencySpeech` ships `audio` alongside `transcript_a/c`, so the training data exists.
 - **The cleanup sidecar is lazily loaded and idle-unloaded.** `Cleaner::warm()` is called on hotkey **press**, so the seconds spent speaking hide the ~3 s model load; `MATALU_CLEAN_IDLE_MS` (180000) kills the child once unused, keeping ~1 GB out of resident RAM between dictations. `warm()` never blocks the caller.
 - **Config is env-var only** (`crates/core/src/config.rs`, `Config::from_env`). Notable vars: `MATALU_BIND` (`127.0.0.1:8765`, headless only), `MATALU_PYTHON`, `MATALU_SIDECAR`, `MATALU_SIDECAR_BIN` (optional bundled sidecar executable — overrides python+script), `MATALU_MLX_MODEL`, `MATALU_SILENCE_MS` (700), `MATALU_VAD_RMS` (0.010), `MATALU_INPUT_DEVICE` (optional — capture a named input device by its `Display` name instead of the default mic; used for meeting mode), `MATALU_MAX_UTTERANCE_MS` (12000; sidecar-read — forces a `final`+context reset after this much continuous speech), `MATALU_IDLE_RESET_MS` (3000; sidecar-read — resets the streaming context + clears the MLX cache after this much continuous idle silence, so meeting mode's non-stop feed can't grow the cache pool to GBs), `MATALU_ASR_BITS` (8; sidecar-read — ASR weight quantization, `0` = bf16), `MATALU_DEMO`.
   Cleanup-stage vars (read in `src-tauri/src/cleaner.rs` / `sidecar/clean_sidecar.py`): `MATALU_CLEAN_MODEL` (override; else a bundled `sidecar/models/Qwen2.5-1.5B-Instruct-4bit/` dir, else the Hub repo — same three-tier shape as the ASR model), `MATALU_CLEAN_ADAPTER` (QLoRA adapter dir; defaults to `sidecar/adapters/cleanup/` if present), `MATALU_CLEAN_SIDECAR`, `MATALU_CLEAN_TIMEOUT_MS` (2000 base), `MATALU_CLEAN_IDLE_MS` (180000), `MATALU_NO_CLEANUP` (force the raw live-partial path; also implied by `MATALU_DEMO`). The user-facing on/off toggle is a persisted setting (`settings.cleanup`), not an env var.
