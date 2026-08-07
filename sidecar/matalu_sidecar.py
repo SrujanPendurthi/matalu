@@ -11,6 +11,14 @@ Protocol (kept deliberately dumb so the Rust side owns capture + transport):
 Utterance segmentation is done here with a simple RMS silence VAD: `partial`
 frames grow live as audio streams; a `final` is emitted after SILENCE_MS of
 quiet, and the streaming context is reset for the next utterance.
+
+**Partials stream; finals are decoded at full context.** Streaming attention is
+a large accuracy tax — measured 6.12% WER streaming vs 1.49% full-context on
+LibriSpeech test-clean (published: 1.69%). The app buffers a whole dictation and
+pastes once, so partials are only cosmetic (the pill and transcript window); the
+text that actually gets injected comes from the `final`. So each utterance's raw
+samples are buffered and re-decoded in one pass when the VAD ends it. See
+`finalize()`.
 """
 import json
 import os
@@ -19,6 +27,7 @@ import numpy as np
 import mlx.core as mx
 
 from parakeet_mlx import from_pretrained
+from parakeet_mlx.audio import get_logmel
 
 SR = 16000
 
@@ -75,6 +84,11 @@ CONTEXT_SIZE = (int(_ctx[0]), int(_ctx[1]))
 # -383 MB, 1.37x faster); 0 disables and keeps bf16. See quantize_model().
 ASR_BITS = int(os.environ.get("MATALU_ASR_BITS", "8"))
 
+# Decode each `final` from the buffered utterance at full context instead of
+# taking the streaming result. Measured 4.2x more accurate AND 3.1x faster.
+# `0` restores the streaming-result behavior. See finalize().
+FULL_CONTEXT_FINAL = os.environ.get("MATALU_FULL_CONTEXT_FINAL", "1") != "0"
+
 
 def log(msg: str) -> None:
     sys.stderr.write(f"[sidecar] {msg}\n")
@@ -84,6 +98,32 @@ def log(msg: str) -> None:
 def emit(kind: str, text: str, ts_ms: int) -> None:
     sys.stdout.write(json.dumps({"type": kind, "text": text, "ts_ms": ts_ms}) + "\n")
     sys.stdout.flush()
+
+
+def finalize(model, buffered, streamed_text: str) -> str:
+    """Text for a `final`: one full-context decode over the buffered utterance.
+
+    Streaming attention costs ~4x WER (6.12% vs 1.49% on LibriSpeech test-clean,
+    published 1.69%), and the app only injects the `final` — partials are
+    cosmetic. So the utterance's raw samples are re-decoded in a single pass,
+    the same path `model.transcribe()` takes internally.
+
+    Best-effort: any failure returns the streaming result, which is what this
+    used to emit. A worse transcript beats a lost utterance.
+    """
+    if not FULL_CONTEXT_FINAL or not buffered:
+        return streamed_text
+    audio = np.concatenate(buffered)
+    # get_logmel needs at least one hop, and a sub-hop clip would raise rather
+    # than return empty. Nothing useful to decode there anyway.
+    if len(audio) < model.preprocessor_config.hop_length:
+        return streamed_text
+    try:
+        mel = get_logmel(mx.array(audio), model.preprocessor_config)
+        return model.generate(mel)[0].text
+    except Exception as e:  # noqa: BLE001 — never lose the utterance
+        log(f"WARNING: full-context decode failed ({e!r}); using streaming result")
+        return streamed_text
 
 
 def new_stream(model):
@@ -182,6 +222,8 @@ def main() -> None:
     utterance_ms = 0     # continuous-speech duration since the last final
     idle_ms = 0          # continuous idle-silence duration (no active utterance)
     in_utterance = False
+    utt_buf = []         # raw samples of the current utterance, for finalize()
+    prev_chunk = None    # one chunk of pre-roll, so a quiet onset isn't clipped
 
     ctx, tx = new_stream(model)
 
@@ -203,11 +245,15 @@ def main() -> None:
                 dump.writeframes((np.clip(samples, -1.0, 1.0) * 32767).astype("<i2").tobytes())
 
             rms = float(np.sqrt(np.mean(np.square(samples)))) if n else 0.0
-            # Always feed audio so the streaming cache stays continuous and
-            # trailing words flush during the silence tail.
-            tx.add_audio(mx.array(samples))
+            speech = rms > VAD_RMS
 
-            if rms > VAD_RMS:
+            if speech:
+                if not in_utterance:
+                    # Start the buffer one chunk early. The VAD fires on RMS, so
+                    # a word that begins quietly often starts in the *previous*
+                    # chunk; without this pre-roll the full-context decode clips
+                    # the utterance's first syllable.
+                    utt_buf = [prev_chunk] if prev_chunk is not None else []
                 in_utterance = True
                 silence_ms = 0
                 idle_ms = 0
@@ -217,14 +263,25 @@ def main() -> None:
                 utterance_ms += step_ms
 
             if in_utterance:
-                emit("partial", tx.result.text, ts_ms)
+                utt_buf.append(samples)
+                # Feed the encoder only while there is speech. Silence used to be
+                # fed so trailing words flushed into the streaming result, but the
+                # `final` now comes from finalize(), so encoding the silence tail
+                # is pure waste — and it was the expensive half of the drain.
+                # Gated on the same flag: with full-context finals off, the
+                # streaming result *is* the final and still needs that flush, so
+                # MATALU_FULL_CONTEXT_FINAL=0 restores the old behavior exactly.
+                if speech or not FULL_CONTEXT_FINAL:
+                    tx.add_audio(mx.array(samples))
+                    emit("partial", tx.result.text, ts_ms)
                 # Commit + reset on a silence gap (utterance ended) OR the
                 # max-utterance cap (long continuous speech that never pauses,
                 # e.g. a meeting monologue) so the transcript keeps flowing and
                 # the streaming context stays bounded. new_stream() also clears
                 # MLX's pooled buffers so the reset frees memory.
                 if silence_ms >= SILENCE_MS or utterance_ms >= MAX_UTTERANCE_MS:
-                    emit("final", tx.result.text, ts_ms)
+                    emit("final", finalize(model, utt_buf, tx.result.text), ts_ms)
+                    utt_buf = []
                     ctx.__exit__(None, None, None)
                     ctx, tx = new_stream(model)
                     in_utterance = False
@@ -234,11 +291,14 @@ def main() -> None:
                 # Idle silence with no active utterance. We keep feeding real
                 # audio (meeting mode never gates to NONE), so periodically drop
                 # the accumulated silence context to keep MLX memory bounded.
+                tx.add_audio(mx.array(samples))
                 idle_ms += step_ms
                 if idle_ms >= IDLE_RESET_MS:
                     ctx.__exit__(None, None, None)
                     ctx, tx = new_stream(model)
                     idle_ms = 0
+
+            prev_chunk = samples
     finally:
         try:
             ctx.__exit__(None, None, None)

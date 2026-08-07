@@ -36,6 +36,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import soundfile as sf
+from parakeet_mlx.audio import get_logmel
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "sidecar"))
@@ -154,22 +155,29 @@ def load_asr():
 
 
 def transcribe(model, audio):
-    """Feed audio in whole CHUNK-sized blocks, exactly as the sidecar does.
+    """Transcribe as the sidecar does: full-context decode of the utterance.
 
-    The tail must be zero-padded, not passed short: a ragged final chunk makes
-    parakeet-mlx's mel front-end compute a negative frame count, which surfaces
-    as `metal::malloc attempting to allocate 18446744073709547520 bytes`
-    (2**64 - 4096, an unsigned underflow). The app never hits this because the
-    sidecar reads fixed CHUNK*4 byte blocks off a pipe and so always has full
-    chunks; only a caller slicing an array can produce a short one.
+    Mirrors `matalu_sidecar.py::finalize` — partials stream for the UI, but the
+    `final` (the only text the app injects) is one full-context pass over the
+    buffered utterance. Streaming finals measured 6.12% WER vs 1.49% here.
+
+    Set `MATALU_FULL_CONTEXT_FINAL=0` to score the old streaming path instead,
+    for A/B against this one.
     """
+    if os.environ.get("MATALU_FULL_CONTEXT_FINAL", "1") != "0":
+        return model.generate(get_logmel(mx.array(audio), model.preprocessor_config))[0].text
+
+    # Legacy streaming path. The tail must be zero-padded, not passed short: a
+    # ragged final chunk makes parakeet-mlx's mel front-end compute a negative
+    # frame count, surfacing as a 2**64-4096 metal::malloc. The app never hits
+    # this because the sidecar reads fixed CHUNK*4 byte blocks off a pipe.
     with model.transcribe_stream(context_size=CONTEXT) as tx:
         for i in range(0, len(audio), CHUNK):
             block = audio[i : i + CHUNK]
             if len(block) < CHUNK:
                 block = np.pad(block, (0, CHUNK - len(block)))
             tx.add_audio(mx.array(block))
-        for _ in range(3):  # drain, as the app does
+        for _ in range(3):  # drain, as the app did
             tx.add_audio(mx.array(np.zeros(CHUNK, dtype=np.float32)))
         return tx.result.text
 
