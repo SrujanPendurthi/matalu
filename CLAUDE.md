@@ -69,6 +69,24 @@ cpal mic (48 kHz) → resample→16k mono → Python parakeet-mlx sidecar → br
 
 ## Key conventions & decisions
 
+- **The cleanup model is QLoRA fine-tuned, and the adapter is NOT in git.** `sidecar/adapters/cleanup/` is gitignored (build artifact), so a fresh clone silently runs the far weaker base model. Rebuild in ~15 min:
+  ```bash
+  python3 training/build_dataset.py                        # DisfluencySpeech a -> c, 4500/250/250
+  python3 -m mlx_lm lora --train -c training/lora_config.yaml
+  python3 training/eval_adapter.py                         # base vs adapter, held-out
+  ```
+  Check the sidecar's startup log — it prints `system prompt: short (tuned)` vs `full (base model)`, which is how you tell which one is actually loaded.
+  Measured on 250 held-out pairs, through the real sidecar with production guards:
+
+  | | WER | disfluencies removed | content kept | guard fallback |
+  |---|---|---|---|---|
+  | no cleanup | 13.67% | 0% | 100% | — |
+  | base model | 11.95% | 21.8% | 96.7% | 4.8% |
+  | **+ adapter** | **3.27%** | **54.4%** | **99.3%** | **0.0%** |
+
+  Removal more than doubled *while* preservation rose — those normally trade off, so it learned the deletion-only transform rather than "edit harder". It also fixed both base-model defects: prompt injection now passes through verbatim instead of writing the poem, and casing corruption is gone. Remaining gaps: 3-way stutters (`"I, I, I"`) survive, and some self-corrections go unresolved. Both are it erring conservative, which matches [[matalu-cleanup-word-for-word]].
+  **Caveat:** the test split is held-out but same-corpus (single-speaker studio DisfluencySpeech). Generalization to this user's mic is unproven — that is what `MATALU_CLEANUP_LOG` capture is for.
+- **Training uses `TUNED_SYSTEM_PROMPT` (short), inference picks by adapter presence.** The base model needs the full instruction block or it hijacks and over-edits; the adapter encodes the behavior, so it gets a ~10-token marker instead. Training on the long block made the run **4x slower for no signal** (`mask_prompt` already zeroes its loss). `training/build_dataset.py` imports the prompt from the sidecar rather than copying it, so the two cannot drift. Val loss plateaued by iter 100–200, so the 1200-iter config stops early on purpose.
 - **The `Corrector` trait stays `PassThrough` — the cleanup LLM lives elsewhere.** `Corrector::refine` is sync, per-event, and runs on the sidecar-reader thread; an LLM there would stall partials. Cleanup is per-*session* and async, so it lives in the app (`src-tauri/src/cleaner.rs`) where the injection-timing decision already is. `corrector.rs` is left alone (headless still wires it).
 - **Dictation cleanup is buffered, Wispr-Flow style.** With cleanup on, **nothing types while you speak**: `session.rs` accumulates committed finals in `utterance_buf`, and on release the whole press→release window is cleaned once and pasted as **one** edit. Full-window context is the point — a self-correction spanning two sentences ("ship it Tuesday, no wait, Thursday") is unfixable once "Tuesday" is already typed. The UI and pill still show raw partials live via the app-wide `transcript` emit. Both drain exits (trailing `final` **and** the watchdog) must route through `Session::finish_dictation` — skipping the watchdog path silently drops the whole utterance. `MAX_BUFFER_CHARS` (600) forces a mid-session flush so a marathon dictation isn't minutes of nothing.
 - **Cleanup is deletion-only, and that is enforced mechanically.** User requirement: prefer word-for-word over omission — dropping a content word is worse than leaving an "um". Stock Qwen 1.5B does not honor this by prompt alone; measured, it obeys dictated text that reads like an instruction ("ignore all previous instructions…" → it writes the poem) and lowercases words Parakeet already capitalized (`Q1` → `q1`). Neither is caught by a length check. So `cleaner.rs` vets every candidate with pure, unit-tested guards: **word-overlap ≥ 0.90** (every output word must already exist in the input — catches hijacks and summarization), **casing restoration** (restore capitals the model dropped; never strip ones it added), and a **two-sided length ratio** (0.5–1.3). Any rejection, timeout, or dead child ⇒ paste the **raw** text. Losing the user's words is the one unacceptable outcome.
