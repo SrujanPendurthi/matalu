@@ -86,15 +86,21 @@ cpal mic (48 kHz) → resample→16k mono → Python parakeet-mlx sidecar → br
 
   Removal more than doubled *while* preservation rose — those normally trade off, so it learned the deletion-only transform rather than "edit harder". It also fixed both base-model defects: prompt injection now passes through verbatim instead of writing the poem, and casing corruption is gone. Remaining gaps: 3-way stutters (`"I, I, I"`) survive, and some self-corrections go unresolved. Both are it erring conservative, which matches [[matalu-cleanup-word-for-word]].
   **Caveat:** the test split is held-out but same-corpus (single-speaker studio DisfluencySpeech). Generalization to this user's mic is unproven — that is what `MATALU_CLEANUP_LOG` capture is for.
-- **Do NOT `mlx_lm.fuse` the cleanup adapter — it destroys most of the fine-tune.** Tried and measured. Fusing is 1.36x faster (−181 ms; the adapter's extra matmuls really do cost ~36%), but merging a full-precision LoRA delta into 4-bit weights and requantizing rounds most of the delta away — it is small relative to the quantization step:
+- **Do NOT `mlx_lm.fuse` the cleanup adapter. All three fusion variants were measured and all three lose.** Keeping the LoRA delta *separate and full-precision* beats merging it into low-precision weights, on every axis:
 
-  | | WER | removed | kept | captures |
-  |---|---|---|---|---|
-  | base | 11.95% | 21.8% | 96.7% | 12.6% |
-  | **+ adapter** | **3.27%** | **54.4%** | **99.3%** | **76.1%** |
-  | fused | 9.67% | 34.2% | 96.4% | 29.3% |
+  | | WER | removed | kept | fallback | mem | latency |
+  |---|---|---|---|---|---|---|
+  | base model | 11.95% | 21.8% | 96.7% | 4.8% | 860 MB | 485 ms |
+  | **base + adapter** | **3.27%** | **54.4%** | **99.3%** | **0.0%** | **860 MB** | 689 ms |
+  | fused, 4-bit requant | 9.67% | 34.2% | 96.4% | 5.2% | 839 MB | 508 ms |
+  | fused `--dequantize` | 3.29% | 54.4% | 99.3% | 0.0% | 3087 MB | 1381 ms |
+  | fused → 8-bit | 3.62% | 54.4% | 99.0% | 0.4% | 1500 MB | 853 ms |
 
-  181 ms is not worth 47 points of capture. Keep the adapter loaded at runtime. (A `--dequantize` fuse would preserve the delta but roughly doubles resident memory — untested, and the adapter path is simpler.)
+  - **4-bit requant destroys the tune** (76% → 29% of achievable gain): the delta is full-precision and small relative to the 4-bit step, so it rounds away. Fast, but useless.
+  - **`--dequantize` preserves the tune exactly** (3.29% vs 3.27%) and proves requantization was the culprit — but bf16 means 3087 MB read per token, so it is **2x slower** than the adapter, not faster.
+  - **8-bit** is the middle and still loses on all three: worse WER, 1.7x memory, 1.24x slower.
+
+  The 4-bit base is simply hard to beat — smallest weights means least bandwidth — and the adapter's ~36% compute tax is cheaper than any dequantization penalty. Don't re-litigate this without new evidence.
 - **Training uses `TUNED_SYSTEM_PROMPT` (short), inference picks by adapter presence.** The base model needs the full instruction block or it hijacks and over-edits; the adapter encodes the behavior, so it gets a ~10-token marker instead. Training on the long block made the run **4x slower for no signal** (`mask_prompt` already zeroes its loss). `training/build_dataset.py` imports the prompt from the sidecar rather than copying it, so the two cannot drift. Val loss plateaued by iter 100–200, so the 1200-iter config stops early on purpose.
 - **The `Corrector` trait stays `PassThrough` — the cleanup LLM lives elsewhere.** `Corrector::refine` is sync, per-event, and runs on the sidecar-reader thread; an LLM there would stall partials. Cleanup is per-*session* and async, so it lives in the app (`src-tauri/src/cleaner.rs`) where the injection-timing decision already is. `corrector.rs` is left alone (headless still wires it).
 - **Dictation cleanup is buffered, Wispr-Flow style.** With cleanup on, **nothing types while you speak**: `session.rs` accumulates committed finals in `utterance_buf`, and on release the whole press→release window is cleaned once and pasted as **one** edit. Full-window context is the point — a self-correction spanning two sentences ("ship it Tuesday, no wait, Thursday") is unfixable once "Tuesday" is already typed. The UI and pill still show raw partials live via the app-wide `transcript` emit. Both drain exits (trailing `final` **and** the watchdog) must route through `Session::finish_dictation` — skipping the watchdog path silently drops the whole utterance. `MAX_BUFFER_CHARS` (600) forces a mid-session flush so a marathon dictation isn't minutes of nothing.
