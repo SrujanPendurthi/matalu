@@ -91,21 +91,22 @@ cpal mic (48 kHz) → resample→16k mono → Python parakeet-mlx sidecar → br
   - **`n=2, k=4` (`MATALU_CLEAN_DRAFT_N`/`_K`).** Bigger drafts lose: a rejected token wastes the rest of its batch, so k=4 accepts 79% where k=16 accepts 33%.
   - **The first implementation reported 1.45x while producing *different* text** — it ran past EOS, because a batch of accepted drafts can overshoot the stop token in a way greedy never does. Exactness is not a nice-to-have here; an unchecked speculative decoder is just a fast wrong answer.
   - The startup self-check compares **plain greedy** against lookup and against cache+lookup. Checking the two optimized paths against each other would pass while both were wrong — keep the un-optimized reference.
-- **Do NOT `mlx_lm.fuse` the cleanup adapter. All three fusion variants were measured and all three lose.** Keeping the LoRA delta *separate and full-precision* beats merging it into low-precision weights, on every axis:
+- **Do NOT `mlx_lm.fuse` the cleanup adapter. Four fusion variants were measured; all four lose.** Numbers below are on a common 100-pair subset where the shipping config scores 2.84%:
 
   | | WER | removed | kept | fallback | mem | latency |
   |---|---|---|---|---|---|---|
-  | base model | 11.95% | 21.8% | 96.7% | 4.8% | 860 MB | 485 ms |
-  | **base + adapter** | **3.27%** | **54.4%** | **99.3%** | **0.0%** | **860 MB** | 689 ms |
+  | base model | 11.27% | 21.8% | 96.7% | 4.0% | 860 MB | 485 ms |
+  | **base + adapter** | **2.84%** | **54.0%** | **99.0%** | **0.0%** | **860 MB** | 595 ms |
   | fused, 4-bit requant | 9.67% | 34.2% | 96.4% | 5.2% | 839 MB | 508 ms |
-  | fused `--dequantize` | 3.29% | 54.4% | 99.3% | 0.0% | 3087 MB | 1381 ms |
+  | fused → mixed 4/8-bit | 3.15% | 53.1% | 99.0% | 0.0% | 1200 MB | 723 ms |
   | fused → 8-bit | 3.62% | 54.4% | 99.0% | 0.4% | 1500 MB | 853 ms |
+  | fused `--dequantize` | 3.29% | 54.4% | 99.3% | 0.0% | 3087 MB | 1381 ms |
 
-  - **4-bit requant destroys the tune** (76% → 29% of achievable gain): the delta is full-precision and small relative to the 4-bit step, so it rounds away. Fast, but useless.
-  - **`--dequantize` preserves the tune exactly** (3.29% vs 3.27%) and proves requantization was the culprit — but bf16 means 3087 MB read per token, so it is **2x slower** than the adapter, not faster.
-  - **8-bit** is the middle and still loses on all three: worse WER, 1.7x memory, 1.24x slower.
+  - **4-bit requant destroys the tune.** The delta is full-precision and small relative to the 4-bit step, so it rounds away.
+  - **`--dequantize` preserves it exactly**, which proves requantization is the culprit — but bf16 reads 3087 MB per token, making it 2x *slower* than the adapter.
+  - **Mixed 4/8-bit is the best fusion**, built with a custom `quant_predicate` protecting the 112 LoRA-touched modules (layers 12–27, all seven projections) at 8-bit and the rest at 4-bit — 6.441 bits/weight. It recovers nearly all the quality (9.67% → 3.15%) and beats AWQ's premise, since we *know* which weights changed rather than inferring salience from calibration data. It still loses on all three axes.
 
-  The 4-bit base is simply hard to beat — smallest weights means least bandwidth — and the adapter's ~36% compute tax is cheaper than any dequantization penalty. Don't re-litigate this without new evidence.
+  **The reason is worth internalizing: the adapter already is the optimal mixed-precision scheme.** 4-bit base + a full-precision delta stored separately = 4.5 effective bits + 21 MB. Every requantization scheme is trying to approximate, inside quantized weights, information the adapter simply keeps. Don't re-litigate without new evidence.
 - **Training uses `TUNED_SYSTEM_PROMPT` (short), inference picks by adapter presence.** The base model needs the full instruction block or it hijacks and over-edits; the adapter encodes the behavior, so it gets a ~10-token marker instead. Training on the long block made the run **4x slower for no signal** (`mask_prompt` already zeroes its loss). `training/build_dataset.py` imports the prompt from the sidecar rather than copying it, so the two cannot drift. Val loss plateaued by iter 100–200, so the 1200-iter config stops early on purpose.
 - **The `Corrector` trait stays `PassThrough` — the cleanup LLM lives elsewhere.** `Corrector::refine` is sync, per-event, and runs on the sidecar-reader thread; an LLM there would stall partials. Cleanup is per-*session* and async, so it lives in the app (`src-tauri/src/cleaner.rs`) where the injection-timing decision already is. `corrector.rs` is left alone (headless still wires it).
 - **Dictation cleanup is buffered, Wispr-Flow style.** With cleanup on, **nothing types while you speak**: `session.rs` accumulates committed finals in `utterance_buf`, and on release the whole press→release window is cleaned once and pasted as **one** edit. Full-window context is the point — a self-correction spanning two sentences ("ship it Tuesday, no wait, Thursday") is unfixable once "Tuesday" is already typed. The UI and pill still show raw partials live via the app-wide `transcript` emit. Both drain exits (trailing `final` **and** the watchdog) must route through `Session::finish_dictation` — skipping the watchdog path silently drops the whole utterance. `MAX_BUFFER_CHARS` (600) forces a mid-session flush so a marathon dictation isn't minutes of nothing.
