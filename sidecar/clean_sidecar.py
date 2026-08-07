@@ -21,7 +21,17 @@ import json
 import os
 import sys
 
-SIDECAR_DIR = os.path.dirname(os.path.abspath(__file__))
+def _resource_dir() -> str:
+    """Where bundled data (models, adapter) lives.
+
+    Under PyInstaller onefile the payload is unpacked to a temp dir exposed as
+    `sys._MEIPASS`, and `__file__` points inside it — but relying on that
+    coincidence is how bundled builds break silently. Ask explicitly.
+    """
+    return getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+
+
+SIDECAR_DIR = _resource_dir()
 
 # Same three-tier precedence as the ASR sidecar: explicit override, then a
 # bundled local dir (fully offline), then the Hub (downloads + caches once).

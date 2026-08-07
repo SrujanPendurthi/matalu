@@ -172,6 +172,9 @@ pub struct Cleaner {
     spawning: Mutex<bool>,
     python: String,
     script: String,
+    /// A self-contained bundled executable (PyInstaller). When `Some` it is run
+    /// directly and `python`/`script` are ignored.
+    bin: Option<String>,
     timeout: Duration,
     idle: Duration,
 }
@@ -183,6 +186,16 @@ impl Cleaner {
         let script = std::env::var("MATALU_CLEAN_SIDECAR").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), "/../sidecar/clean_sidecar.py").to_string()
         });
+        // Prefer a bundled executable in a packaged .app, exactly as the ASR
+        // sidecar does; fall back to `python3 clean_sidecar.py` in dev. An
+        // explicit MATALU_CLEAN_SIDECAR wins over both so a developer can point
+        // at a working tree even inside a bundle.
+        let bin = if std::env::var_os("MATALU_CLEAN_SIDECAR").is_some() {
+            None
+        } else {
+            crate::pipeline::bundled_binary("matalu-cleaner")
+                .map(|p| p.to_string_lossy().into_owned())
+        };
         // Base budget; the per-request timeout adds TIMEOUT_PER_CHAR per input char.
         let timeout = Duration::from_millis(env_ms("MATALU_CLEAN_TIMEOUT_MS", 2_000));
         // 30 min, not 3. Cold start is ~5.5 s (model load + the two self-checks),
@@ -199,6 +212,7 @@ impl Cleaner {
             spawning: Mutex::new(false),
             python,
             script,
+            bin,
             timeout,
             idle,
         });
@@ -241,9 +255,21 @@ impl Cleaner {
     /// Spawn the child and block until it reports ready. The model load is far
     /// longer than a per-request timeout, so readiness gets its own budget.
     fn spawn_child(&self) -> anyhow::Result<Live> {
-        tracing::info!(python = %self.python, script = %self.script, "starting cleanup sidecar");
-        let mut child = Command::new(&self.python)
-            .arg(&self.script)
+        let mut command = match &self.bin {
+            Some(bin) => {
+                tracing::info!(bin = %bin, "starting bundled cleanup sidecar");
+                Command::new(bin)
+            }
+            None => {
+                tracing::info!(
+                    python = %self.python, script = %self.script, "starting cleanup sidecar"
+                );
+                let mut c = Command::new(&self.python);
+                c.arg(&self.script);
+                c
+            }
+        };
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

@@ -117,7 +117,7 @@ pub fn start(app: AppHandle, mode: Mode, cleanup: bool) -> anyhow::Result<Starte
     // Prefer a bundled sidecar binary shipped next to the app executable
     // (packaged build) unless the dev env vars pin python/script explicitly.
     if cfg.sidecar_bin.is_none() && std::env::var_os("MATALU_SIDECAR").is_none() {
-        if let Some(bundled) = bundled_sidecar_path() {
+        if let Some(bundled) = bundled_binary("matalu-sidecar") {
             tracing::info!(path = %bundled.display(), "using bundled sidecar binary");
             cfg.sidecar_bin = Some(bundled.to_string_lossy().into_owned());
         } else {
@@ -219,13 +219,15 @@ pub fn start(app: AppHandle, mode: Mode, cleanup: bool) -> anyhow::Result<Starte
 /// next to the **dev** binary (`target/debug/`) on a plain `cargo build`, so we
 /// must gate on actually running from `…/Contents/MacOS/` or `cargo tauri dev`
 /// would exec the placeholder stub instead of falling back to the Python script.
-fn bundled_sidecar_path() -> Option<std::path::PathBuf> {
+///
+/// Shared by both sidecars (`matalu-sidecar`, `matalu-cleaner`).
+pub(crate) fn bundled_binary(name: &str) -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
     if dir.file_name()?.to_str()? != "MacOS" {
         return None; // not a packaged .app (e.g. dev target/debug) — use Python
     }
-    let candidate = dir.join("matalu-sidecar");
+    let candidate = dir.join(name);
     candidate.exists().then_some(candidate)
 }
 

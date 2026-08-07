@@ -50,7 +50,10 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "externalBin": ["binaries/matalu-sidecar"],
+    "externalBin": [
+      "binaries/matalu-sidecar",
+      "binaries/matalu-cleaner"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

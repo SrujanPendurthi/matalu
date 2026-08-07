@@ -1,0 +1,18 @@
+#!/bin/sh
+# PLACEHOLDER — not the real cleanup sidecar.
+#
+# Tauri's `externalBin` requires this file to exist at build time, so this stub
+# is committed to keep `cargo build` / `cargo tauri dev` working. Tauri copies it
+# next to the dev binary too, but the app only prefers a bundled sidecar when
+# running from a packaged `…/Contents/MacOS/` .app — so in dev it falls back to
+# `python3 clean_sidecar.py` and this stub is never executed.
+#
+# Before packaging (`cargo tauri build`), run `sidecar/build_sidecar.sh` to
+# replace this with the real PyInstaller-built cleaner.
+#
+# Exiting non-zero here is deliberate. Cleanup is best-effort by design — the app
+# pastes raw text whenever the cleaner is unavailable — so a packaged build that
+# shipped without this binary would look like it worked while silently dropping
+# to the untuned path. Failing loudly at spawn is the only way that shows up.
+echo "[matalu-cleaner] placeholder binary: run sidecar/build_sidecar.sh to build the real cleaner before packaging." >&2
+exit 1
