@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Merged into the bundle's Info.plist by tauri-bundler.
+
+  NSMicrophoneUsageDescription is load-bearing, not cosmetic. Without it macOS
+  never shows the mic prompt and TCC denies the request — but CoreAudio's HAL
+  does not report the denial. `build_input_stream` succeeds and delivers a
+  stream of zeros, so the sidecar warms, the session reports ready, and the VAD
+  never fires. The app looks healthy and transcribes nothing.
+
+  Launching the binary from a terminal hides this completely: TCC attributes the
+  check to the *responsible* process, so the child inherits the terminal's own
+  microphone grant. Microphone and Accessibility must both be tested by opening
+  the .app.
+-->
+<plist version="1.0">
+<dict>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Matalu transcribes your speech on-device so it can type it into the app you are using. Audio never leaves your Mac.</string>
+</dict>
+</plist>

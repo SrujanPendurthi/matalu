@@ -29,8 +29,46 @@ pub struct AppState {
     pub _sidecar_child: std::sync::Mutex<Option<std::process::Child>>,
 }
 
+/// Point stdout+stderr at `~/Library/Logs/matalu.log` when running from a
+/// packaged `.app`, where both are otherwise wired to `/dev/null`.
+///
+/// This is `dup2` on the file descriptors rather than a `tracing` writer on
+/// purpose: both sidecars are spawned with `Stdio::inherit()`, so redirecting
+/// fd 2 captures *their* logs too — model load, quantization, the cleaner's
+/// tuned-prompt line. Those are half the diagnostic value and a Rust-side
+/// subscriber would miss all of them.
+///
+/// Only when bundled. In dev the terminal is the log.
+fn redirect_output_to_log() {
+    let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.to_path_buf()))
+    else {
+        return;
+    };
+    if dir.file_name().and_then(|n| n.to_str()) != Some("MacOS") {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME") else { return };
+    let path = std::path::Path::new(&home).join("Library/Logs/matalu.log");
+    let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+        return;
+    };
+
+    extern "C" {
+        fn dup2(src: i32, dst: i32) -> i32;
+    }
+    use std::os::fd::AsRawFd;
+    let fd = file.as_raw_fd();
+    unsafe {
+        dup2(fd, 1);
+        dup2(fd, 2);
+    }
+}
+
 /// Tauri entry point.
 pub fn run() {
+    redirect_output_to_log();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
