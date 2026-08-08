@@ -36,5 +36,6 @@ pub fn plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
 /// is in managed state.
 pub fn register(app: &App, shortcut: Shortcut) -> Result<(), Box<dyn std::error::Error>> {
     app.global_shortcut().register(shortcut)?;
+    tracing::info!(?shortcut, "global activation hotkey registered");
     Ok(())
 }

@@ -137,10 +137,15 @@ pub fn start(app: AppHandle, mode: Mode, cleanup: bool) -> anyhow::Result<Starte
     let inject = if std::env::var("MATALU_NO_INJECT").is_ok() {
         None
     } else {
-        if !injector::accessibility_trusted() {
+        // Ask, don't just log. Untrusted means every keystroke is discarded with
+        // no error anywhere the user can see — the app transcribes perfectly and
+        // types nothing. The system dialog has a direct "Open System Settings"
+        // button, which is the only self-service path out of that state.
+        if !injector::prompt_for_accessibility() {
             tracing::warn!(
                 "Accessibility permission not granted; text injection will silently \
-                 no-op until it is enabled in System Settings → Privacy & Security → Accessibility"
+                 no-op until it is enabled in System Settings → Privacy & Security → \
+                 Accessibility. Prompted the user; a restart may be needed after granting."
             );
         }
         match injector::spawn() {

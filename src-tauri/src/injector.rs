@@ -137,8 +137,21 @@ pub fn spawn() -> anyhow::Result<InjectorHandle> {
                 }
             };
             let mut diff = DiffState::default();
+            // Re-checked here, not just at startup: the user may grant the
+            // permission while the app is running, and a silent no-op is
+            // indistinguishable from "the model produced nothing".
+            let mut warned_untrusted = false;
 
             while let Ok(cmd) = rx.recv() {
+                if !matches!(cmd, Cmd::Reset) && !accessibility_trusted() && !warned_untrusted {
+                    warned_untrusted = true;
+                    tracing::error!(
+                        "discarding injected text: Accessibility is not granted for this app. \
+                         Enable it in System Settings → Privacy & Security → Accessibility, \
+                         then relaunch. (Launching the binary from a terminal can mask this — \
+                         the terminal's own grant is used instead.)"
+                    );
+                }
                 match cmd {
                     Cmd::Reset => diff.reset(),
                     Cmd::Text { text, is_final } => {
@@ -214,6 +227,43 @@ pub fn accessibility_trusted() -> bool {
             fn AXIsProcessTrusted() -> bool;
         }
         unsafe { AXIsProcessTrusted() }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
+/// Same check, but shows the system "grant Accessibility" dialog when untrusted.
+///
+/// Without this the app is silently useless on a fresh install: the hotkey
+/// fires, the model transcribes, and every keystroke is discarded because
+/// `CGEvent.post` is a no-op for an untrusted process. Nothing surfaces —
+/// there is no error, just no text.
+///
+/// **This is why launching from a terminal hides the bug.** macOS attributes
+/// the TCC check to the *responsible* process, so a terminal-spawned build
+/// inherits the terminal's grant and looks trusted; the same bundle launched
+/// from Finder is not. Test permissions by opening the `.app`, never by running
+/// its binary from a shell.
+pub fn prompt_for_accessibility() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use core_foundation::base::TCFType;
+        use core_foundation::boolean::CFBoolean;
+        use core_foundation::dictionary::CFDictionary;
+        use core_foundation::string::{CFString, CFStringRef};
+
+        extern "C" {
+            fn AXIsProcessTrustedWithOptions(options: *const std::ffi::c_void) -> bool;
+            static kAXTrustedCheckOptionPrompt: CFStringRef;
+        }
+        unsafe {
+            let key = CFString::wrap_under_get_rule(kAXTrustedCheckOptionPrompt);
+            let options =
+                CFDictionary::from_CFType_pairs(&[(key, CFBoolean::true_value().as_CFType())]);
+            AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef() as *const _)
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {
