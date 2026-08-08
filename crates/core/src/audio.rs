@@ -181,7 +181,7 @@ where
     let err_cb = |err| tracing::error!(%err, "audio input stream error");
 
     let stream = device
-        .build_input_stream(config.clone(), data_cb, err_cb, None)
+        .build_input_stream(*config, data_cb, err_cb, None)
         .context("failed to build input stream")?;
     Ok(stream)
 }

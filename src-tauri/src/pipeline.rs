@@ -393,6 +393,32 @@ fn forward(app: AppHandle, mut rx: broadcast::Receiver<TranscriptEvent>, session
     });
 }
 
+/// Emit a looping synthetic utterance so the pipeline can be exercised without
+/// audio or the ASR model.
+fn spawn_demo(tx: broadcast::Sender<TranscriptEvent>) {
+    tauri::async_runtime::spawn(async move {
+        let steps = [
+            "hello",
+            "hello world",
+            "hello world this",
+            "hello world this is a demo.",
+        ];
+        let mut ts: u64 = 0;
+        loop {
+            for (i, text) in steps.iter().enumerate() {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                ts += 400;
+                let ev = if i == steps.len() - 1 {
+                    TranscriptEvent::Final { text: text.to_string(), ts_ms: ts }
+                } else {
+                    TranscriptEvent::Partial { text: text.to_string(), ts_ms: ts }
+                };
+                let _ = tx.send(ev);
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,30 +523,4 @@ mod tests {
         burst_drain_silence(&cap_rx, &side_tx, &MeetingRecorder::new(), 700);
         assert_eq!(side_rx.len(), 1, "should have stopped at the queue limit");
     }
-}
-
-/// Emit a looping synthetic utterance so the pipeline can be exercised without
-/// audio or the ASR model.
-fn spawn_demo(tx: broadcast::Sender<TranscriptEvent>) {
-    tauri::async_runtime::spawn(async move {
-        let steps = [
-            "hello",
-            "hello world",
-            "hello world this",
-            "hello world this is a demo.",
-        ];
-        let mut ts: u64 = 0;
-        loop {
-            for (i, text) in steps.iter().enumerate() {
-                tokio::time::sleep(Duration::from_millis(400)).await;
-                ts += 400;
-                let ev = if i == steps.len() - 1 {
-                    TranscriptEvent::Final { text: text.to_string(), ts_ms: ts }
-                } else {
-                    TranscriptEvent::Partial { text: text.to_string(), ts_ms: ts }
-                };
-                let _ = tx.send(ev);
-            }
-        }
-    });
 }

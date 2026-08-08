@@ -4,6 +4,7 @@
 //! everything else (capture, resample, transport). Two threads bridge the pipes:
 //!   - writer: 16 kHz mono f32 audio → child stdin (raw little-endian f32)
 //!   - reader: child stdout (newline JSON) → [`TranscriptEvent`] → broadcast
+//!
 //! The child's stderr is inherited so its logs appear alongside ours.
 
 use std::io::{BufRead, BufReader, Write};
