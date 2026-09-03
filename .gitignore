@@ -29,3 +29,6 @@ __pycache__/
 # instead of 76.1%. Too load-bearing to leave out of a clone.
 # Intermediate checkpoints are not — they duplicate adapters.safetensors.
 /sidecar/adapters/**/[0-9]*_adapters.safetensors
+
+# macOS
+.DS_Store
