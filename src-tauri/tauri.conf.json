@@ -51,7 +51,8 @@
     "active": true,
     "targets": "all",
     "macOS": {
-      "signingIdentity": "-"
+      "signingIdentity": "-",
+      "entitlements": "entitlements.plist"
     },
     "externalBin": [
       "binaries/matalu-sidecar",
