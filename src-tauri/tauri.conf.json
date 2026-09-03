@@ -50,10 +50,6 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "macOS": {
-      "signingIdentity": "-",
-      "entitlements": "entitlements.plist"
-    },
     "externalBin": [
       "binaries/matalu-sidecar",
       "binaries/matalu-cleaner"
