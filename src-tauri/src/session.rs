@@ -39,6 +39,7 @@ use crate::cleaner::Cleaner;
 use crate::diarize::{self, Line};
 use crate::injector::InjectorHandle;
 use crate::pipeline::{gate, MeetingRecorder};
+use matalu::audio;
 
 /// Flush and paste mid-session once the buffer passes this many characters, so
 /// a long dictation isn't minutes of nothing appearing. Costs the full-context
@@ -52,6 +53,16 @@ const MAX_BUFFER_CHARS: usize = 600;
 
 /// Tauri event carrying `{ "listening": bool }` for the UI status indicator.
 pub const STATUS_EVENT: &str = "status";
+
+/// Tauri event carrying `{ "detected": bool, "app": Option<String> }` when the
+/// detector sees a conferencing app start or stop capturing the mic.
+pub const MEETING_HINT_EVENT: &str = "meeting_hint";
+
+/// Tauri event carrying `{ "message": String }` when a meeting starts degraded —
+/// today, the configured Aggregate Device is missing so only the user's side of
+/// the call will be transcribed. Separate from `meeting_hint` (which the
+/// detector owns) so neither can clobber the other's meaning.
+pub const MEETING_WARNING_EVENT: &str = "meeting_warning";
 
 /// How the hotkey drives sessions.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -78,9 +89,24 @@ pub struct Session {
     /// Meeting-transcript mode: capture runs continuously, transcripts fill the
     /// window but are **not** injected, and the dictation hotkey is ignored.
     meeting: AtomicBool,
+    /// A conferencing app is capturing the mic right now (see
+    /// [`crate::meeting_detect`]). Detection only — it changes what the tray
+    /// offers and nothing else. Never starts or stops a recording.
+    meeting_detected: AtomicBool,
     /// Records the meeting audio to a WAV and tracks meeting-relative time, for
     /// post-hoc diarization on stop.
     recorder: Arc<MeetingRecorder>,
+    /// Which device the capture thread should be on. Meeting mode repoints this
+    /// at [`Session::meeting_device`] and restores [`Session::base_device`] on
+    /// stop; the capture thread notices within one poll (~2 s) and reopens.
+    capture_device: audio::DeviceRequest,
+    /// The startup pin (`MATALU_INPUT_DEVICE`), restored when a meeting ends so
+    /// a meeting does not permanently override it. `None` = follow the default.
+    base_device: Option<String>,
+    /// User setting: the Aggregate Device (mic + system audio) to capture during
+    /// a meeting, so both sides of the call are heard. Empty/`None` = stay on
+    /// whatever capture is already using.
+    meeting_device: Mutex<Option<String>>,
     /// Committed meeting lines with timing, accumulated while `meeting`.
     meeting_lines: Mutex<Vec<Line>>,
     /// Read by the audio gate thread; one of [`gate::NONE`]/[`gate::SILENCE`]/
@@ -114,6 +140,9 @@ impl Session {
         cleanup: bool,
         gate: Arc<AtomicU8>,
         recorder: Arc<MeetingRecorder>,
+        capture_device: audio::DeviceRequest,
+        base_device: Option<String>,
+        meeting_device: Option<String>,
         mode: Mode,
         silence_ms: u64,
     ) -> Arc<Self> {
@@ -122,7 +151,11 @@ impl Session {
             mode: Mutex::new(mode),
             ready: Arc::new(AtomicBool::new(false)),
             meeting: AtomicBool::new(false),
+            meeting_detected: AtomicBool::new(false),
             recorder,
+            capture_device,
+            base_device,
+            meeting_device: Mutex::new(meeting_device.filter(|s| !s.is_empty())),
             meeting_lines: Mutex::new(Vec::new()),
             gate,
             injector,
@@ -144,6 +177,10 @@ impl Session {
 
     pub fn set_cleanup(&self, on: bool) {
         self.cleanup.store(on, Ordering::Relaxed);
+    }
+
+    pub fn set_meeting_device(&self, name: Option<String>) {
+        *self.meeting_device.lock().unwrap() = name.filter(|s| !s.is_empty());
     }
 
     /// Whether this dictation buffers for cleanup instead of typing live.
@@ -175,6 +212,21 @@ impl Session {
         self.meeting.load(Ordering::Relaxed)
     }
 
+    pub fn meeting_detected(&self) -> bool {
+        self.meeting_detected.load(Ordering::Relaxed)
+    }
+
+    /// Record what the detector saw and surface it — tray label plus a hint in
+    /// the transcript window. Deliberately does **not** touch the recording.
+    pub fn set_meeting_detected(&self, app_name: Option<&'static str>) {
+        self.meeting_detected.store(app_name.is_some(), Ordering::Relaxed);
+        let _ = self.app.emit(
+            MEETING_HINT_EVENT,
+            serde_json::json!({ "detected": app_name.is_some(), "app": app_name }),
+        );
+        crate::tray::sync_label(&self.app);
+    }
+
     /// Start meeting transcription: capture continuously (gate always `REAL`),
     /// show the transcript window, and stop injecting. No-op until the pipeline
     /// is ready (mic live + model warm).
@@ -190,6 +242,7 @@ impl Session {
         self.meeting.store(true, Ordering::Relaxed);
         *self.state.lock().unwrap() = State::Listening;
         self.meeting_lines.lock().unwrap().clear();
+        self.use_meeting_device();
         // Record the meeting audio for post-hoc diarization (best-effort — if
         // recording can't start, the meeting still transcribes, just unlabeled).
         let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
@@ -213,6 +266,9 @@ impl Session {
     /// takes seconds) which emits the labeled transcript when done.
     pub fn stop_meeting(self: &Arc<Self>) {
         self.meeting.store(false, Ordering::Relaxed);
+        // Restore the startup pin, not `None` — a meeting must not permanently
+        // override MATALU_INPUT_DEVICE.
+        *self.capture_device.lock().unwrap() = self.base_device.clone();
         *self.state.lock().unwrap() = State::Idle;
         self.gate.store(gate::NONE, Ordering::Relaxed);
         self.emit_status(false);
@@ -227,6 +283,37 @@ impl Session {
             }
             _ => tracing::info!("no meeting audio/lines to diarize"),
         }
+    }
+
+    /// Point capture at the configured Aggregate Device for the meeting.
+    ///
+    /// Warns *before* the fact when the device is missing. Capture falls back to
+    /// the bare mic on its own, which still produces a transcript — of the
+    /// user's half of the call only, indistinguishable from a working one. That
+    /// silence is the whole reason this checks up front instead of trusting the
+    /// fallback's log line.
+    fn use_meeting_device(&self) {
+        let Some(name) = self.meeting_device.lock().unwrap().clone() else {
+            return;
+        };
+        if audio::input_device_exists(&name) {
+            *self.capture_device.lock().unwrap() = Some(name.clone());
+            tracing::info!(device = %name, "meeting: capturing the configured device");
+            return;
+        }
+        tracing::warn!(
+            device = %name,
+            "meeting device not found; capturing the current mic — this transcript will \
+             only have your side of the call"
+        );
+        let _ = self.app.emit(
+            MEETING_WARNING_EVENT,
+            serde_json::json!({
+                "message": format!(
+                    "\u{201c}{name}\u{201d} isn\u{2019}t available \u{2014} recording your microphone only,                      so the other participants won\u{2019}t be transcribed."
+                )
+            }),
+        );
     }
 
     // --- hotkey entry points -------------------------------------------------

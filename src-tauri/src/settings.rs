@@ -56,7 +56,7 @@ impl HotkeyPreset {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Settings {
     pub activation_mode: ActivationMode,
     pub hotkey: HotkeyPreset,
@@ -67,6 +67,12 @@ pub struct Settings {
     /// this existed.
     #[serde(default = "default_cleanup")]
     pub cleanup: bool,
+    /// Input device to capture during a meeting transcript — an Aggregate Device
+    /// merging the mic with a system-audio loopback (BlackHole), so both sides of
+    /// the call are heard. Empty means stay on whatever capture is already using,
+    /// which records the user's side only.
+    #[serde(default)]
+    pub meeting_device: String,
 }
 
 fn default_cleanup() -> bool {
@@ -79,6 +85,7 @@ impl Default for Settings {
             activation_mode: ActivationMode::PushToTalk,
             hotkey: HotkeyPreset::AltSpace,
             cleanup: default_cleanup(),
+            meeting_device: String::new(),
         }
     }
 }

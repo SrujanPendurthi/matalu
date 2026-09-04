@@ -2,11 +2,41 @@
 
 use std::sync::Arc;
 
-use tauri::menu::{MenuBuilder, MenuItemBuilder};
+use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
-use tauri::{App, Manager};
+use tauri::{App, AppHandle, Manager, Wry};
 
 use crate::session::Session;
+
+/// The meeting menu item, in managed state so anything can re-label it.
+///
+/// Without this it is reachable only from the tray's own click handler, and both
+/// things that now drive the label from outside — meeting detection, and
+/// `start_meeting` refusing while the model is still loading — would leave it
+/// stale.
+pub struct MeetingItem(MenuItem<Wry>);
+
+/// Re-label the meeting item from the session's actual state.
+///
+/// Always derive it, never set it from the branch just taken: `start_meeting`
+/// no-ops while the pipeline is warming, and the old code's unconditional
+/// "Stop Meeting Transcript" left the menu claiming a recording that never
+/// started — the next click then tried to start it again instead of stopping.
+pub fn sync_label(app: &AppHandle) {
+    let (Some(item), Some(session)) =
+        (app.try_state::<MeetingItem>(), app.try_state::<Arc<Session>>())
+    else {
+        return;
+    };
+    let text = if session.is_meeting() {
+        "Stop Meeting Transcript"
+    } else if session.meeting_detected() {
+        "Meeting detected — Start Transcript"
+    } else {
+        "Start Meeting Transcript"
+    };
+    let _ = item.0.set_text(text);
+}
 
 /// Build the tray icon + menu. For M2 this is Show/Hide + Quit; activation and
 /// status items arrive with the hotkey/session milestones.
@@ -19,8 +49,7 @@ pub fn build(app: &App) -> tauri::Result<()> {
         .items(&[&settings, &meeting, &toggle, &quit])
         .build()?;
 
-    // Clone the meeting item into the handler so it can flip its own label.
-    let meeting_item = meeting.clone();
+    app.manage(MeetingItem(meeting.clone()));
 
     let icon = app
         .default_window_icon()
@@ -39,12 +68,11 @@ pub fn build(app: &App) -> tauri::Result<()> {
                 if let Some(session) = app.try_state::<Arc<Session>>() {
                     if session.is_meeting() {
                         session.stop_meeting();
-                        let _ = meeting_item.set_text("Start Meeting Transcript");
                     } else {
                         session.start_meeting();
-                        let _ = meeting_item.set_text("Stop Meeting Transcript");
                     }
                 }
+                sync_label(app);
             }
             "toggle_window" => {
                 if let Some(win) = app.get_webview_window("main") {

@@ -56,6 +56,12 @@
   </section>
 
   <section>
+    <h2>Meeting transcript</h2>
+    <select id="meeting-device"></select>
+    <div class="hint">Which microphone to record while transcribing a meeting. To capture the other participants as well as yourself, pick an Aggregate Device that merges your mic with a system-audio loopback (BlackHole). Left on “Default microphone”, a meeting records your side of the call only.</div>
+  </section>
+
+  <section>
     <h2>Permissions</h2>
     <div class="perm">
       <span>Accessibility (required to type into apps):</span>
@@ -80,6 +86,18 @@
       document.querySelector(`input[name="mode"][value="${s.activation_mode}"]`).checked = true;
       document.getElementById('hotkey').value = s.hotkey;
       document.getElementById('cleanup').checked = s.cleanup;
+
+      // Populate from the devices that actually exist, so a saved name that has
+      // since gone away is visible as missing rather than silently ignored.
+      const devices = await invoke('list_input_devices');
+      const sel = document.getElementById('meeting-device');
+      sel.innerHTML = '';
+      sel.appendChild(new Option('Default microphone', ''));
+      for (const d of devices) sel.appendChild(new Option(d, d));
+      if (s.meeting_device && !devices.includes(s.meeting_device)) {
+        sel.appendChild(new Option(s.meeting_device + ' (not connected)', s.meeting_device));
+      }
+      sel.value = s.meeting_device || '';
     }
 
     async function refreshPerms() {
@@ -93,8 +111,11 @@
       const mode = document.querySelector('input[name="mode"]:checked').value;
       const hotkey = document.getElementById('hotkey').value;
       const cleanup = document.getElementById('cleanup').checked;
+      const meeting_device = document.getElementById('meeting-device').value;
       try {
-        await invoke('set_settings', { settings: { activation_mode: mode, hotkey, cleanup } });
+        await invoke('set_settings', {
+          settings: { activation_mode: mode, hotkey, cleanup, meeting_device },
+        });
         const el = document.getElementById('saved');
         el.classList.add('show');
         setTimeout(() => el.classList.remove('show'), 1500);

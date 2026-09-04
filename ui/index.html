@@ -37,6 +37,10 @@
   @keyframes blink { 50% { opacity: 0; } }
   .empty { color: #6b7080; font-style: italic; }
   footer { padding: 8px 20px; border-top: 1px solid #23262e; font-size: 12px; color: #6b7080; }
+  .banner { display: none; padding: 9px 20px; font-size: 13px; border-bottom: 1px solid #23262e; }
+  .banner.show { display: block; }
+  #meeting-hint { color: #9db4ff; background: #171b28; }
+  #meeting-warning { color: #e8c07d; background: #241f16; }
 </style>
 </head>
 <body>
@@ -46,6 +50,8 @@
     <button id="save" class="btn">Save</button>
     <button id="clear" class="btn">Clear</button>
   </header>
+  <div id="meeting-hint" class="banner"></div>
+  <div id="meeting-warning" class="banner"></div>
   <main id="log">
     <p class="empty" id="hint">Finalized lines appear here; live text below.</p>
   </main>
@@ -131,6 +137,7 @@
       labeled = null;
       log.innerHTML = '';
       partialEl.innerHTML = '';
+      document.getElementById('meeting-warning').classList.remove('show');
       footer.textContent = 'Cleared.';
     }
 
@@ -168,6 +175,25 @@
       await listen('transcript', (e) => onEvent(e.payload));
       await listen('status', (e) => onStatus(e.payload));
       await listen('meeting_result', (e) => { labeled = e.payload || []; renderMeeting(); });
+
+      // Detection is a suggestion, never an action: the banner tells you a call
+      // is running and the tray item is what starts the transcript.
+      await listen('meeting_hint', (e) => {
+        const { detected, app } = e.payload || {};
+        const el = document.getElementById('meeting-hint');
+        el.textContent = detected
+          ? `${app} is using your microphone — start a meeting transcript from the menu bar to record it.`
+          : '';
+        el.classList.toggle('show', !!detected);
+      });
+
+      // A meeting that started degraded (the configured device is missing, so
+      // only this side of the call is being recorded). Stays up until cleared.
+      await listen('meeting_warning', (e) => {
+        const el = document.getElementById('meeting-warning');
+        el.textContent = (e.payload && e.payload.message) || '';
+        el.classList.add('show');
+      });
       statustext.textContent = 'warming up — loading model…';
     }
     start();

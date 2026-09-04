@@ -112,7 +112,12 @@ pub struct Started {
 
 /// Start the pipeline and return the [`Session`] + sidecar child. `mode` is the
 /// initial activation mode (from persisted settings / env override).
-pub fn start(app: AppHandle, mode: Mode, cleanup: bool) -> anyhow::Result<Started> {
+pub fn start(
+    app: AppHandle,
+    mode: Mode,
+    cleanup: bool,
+    meeting_device: Option<String>,
+) -> anyhow::Result<Started> {
     let mut cfg = Config::from_env();
     // Prefer a bundled sidecar binary shipped next to the app executable
     // (packaged build) unless the dev env vars pin python/script explicitly.
@@ -170,6 +175,10 @@ pub fn start(app: AppHandle, mode: Mode, cleanup: bool) -> anyhow::Result<Starte
     // feed nothing, so the sidecar idles until the first dictation).
     let gate_mode = Arc::new(AtomicU8::new(gate::NONE));
     let recorder = MeetingRecorder::new();
+    // Shared with the capture thread so meeting mode can repoint it at an
+    // Aggregate Device without restarting the pipeline. Seeded from the startup
+    // pin, which the session restores when a meeting ends.
+    let capture_device = audio::device_request(input_device.clone());
     let session = Session::new(
         app.clone(),
         inject,
@@ -177,6 +186,9 @@ pub fn start(app: AppHandle, mode: Mode, cleanup: bool) -> anyhow::Result<Starte
         cleanup,
         gate_mode.clone(),
         recorder.clone(),
+        capture_device.clone(),
+        input_device,
+        meeting_device,
         mode,
         silence_ms,
     );
@@ -214,7 +226,7 @@ pub fn start(app: AppHandle, mode: Mode, cleanup: bool) -> anyhow::Result<Starte
             Ok(()) => tracing::info!("sidecar ready; starting microphone capture"),
             Err(_) => tracing::warn!("sidecar not ready after 180s; starting capture anyway"),
         }
-        audio::spawn_capture(TARGET_SAMPLE_RATE, input_device, capture_tx);
+        audio::spawn_capture(TARGET_SAMPLE_RATE, capture_device, capture_tx);
         session_ready.mark_ready();
     });
 

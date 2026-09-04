@@ -11,6 +11,7 @@ mod diarize;
 mod fnkey;
 mod hotkey;
 mod injector;
+mod meeting_detect;
 mod pipeline;
 mod session;
 mod settings;
@@ -85,6 +86,7 @@ pub fn run() {
             commands::open_accessibility_settings,
             commands::show_settings_window,
             commands::save_transcript,
+            commands::list_input_devices,
         ])
         .setup(|app| {
             // Menu-bar-only: no dock icon, no app window in ⌘-Tab. The UI lives
@@ -109,11 +111,12 @@ pub fn run() {
             };
 
             // Start the core pipeline; get the session + sidecar child.
-            let started = pipeline::start(handle, mode, cfg.cleanup)?;
+            let started = pipeline::start(handle, mode, cfg.cleanup, Some(cfg.meeting_device.clone()))?;
 
             // The hotkey handler resolves the session from managed state; keep a
             // clone for the fn-key tap (which holds the session directly).
             let session = started.session.clone();
+            let detect_session = started.session.clone();
             app.manage(started.session);
             app.manage(AppState {
                 _sidecar_child: std::sync::Mutex::new(started.child),
@@ -128,6 +131,11 @@ pub fn run() {
                 None => {}
             }
             tray::build(app)?;
+
+            // Offer to record a call when one starts. Suggest-only: it re-labels
+            // the tray item and hints in the window, never starts a recording.
+            // Built after the tray, since the label it drives lives there.
+            meeting_detect::spawn(detect_session);
             Ok(())
         })
         .run(tauri::generate_context!())

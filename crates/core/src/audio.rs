@@ -8,6 +8,8 @@
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{ErrorKind, FromSample, SampleFormat, SizedSample, Stream};
+use std::sync::{Arc, Mutex};
+
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
 /// Stateful streaming linear resampler (arbitrary input rate -> `out_rate`).
@@ -68,11 +70,44 @@ impl LinearResampler {
 /// first; short enough that a reconnect feels immediate.
 const REOPEN_DELAY: std::time::Duration = std::time::Duration::from_millis(1000);
 
-/// How often a follow-the-default capture re-checks which device the system
-/// considers the default input. Nothing pushes this at us, so it has to be
-/// polled; 2 s is imperceptible against a human plugging a headset in and costs
-/// one cheap CoreAudio query off the realtime thread.
-const DEFAULT_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+/// How often capture re-checks which device it *should* be on. Neither a
+/// default-device change nor a new request pushes anything at us, so it has to
+/// be polled; 2 s is imperceptible against a human plugging in a headset and
+/// costs one cheap CoreAudio query off the realtime thread.
+const DEVICE_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Which input device capture should be on, shared so it can change while the
+/// app runs: meeting mode repoints it at an Aggregate Device (mic + system
+/// audio) and clears it again on stop. `None` means follow the system default.
+pub type DeviceRequest = Arc<Mutex<Option<String>>>;
+
+/// A [`DeviceRequest`] pinned to `name`, or following the default if `None`.
+pub fn device_request(name: Option<String>) -> DeviceRequest {
+    Arc::new(Mutex::new(name))
+}
+
+/// Display names of every input device, for populating a device picker.
+pub fn list_input_devices() -> Vec<String> {
+    match cpal::default_host().input_devices() {
+        // cpal 0.18 exposes the device name via `Display`, not a `name()` method.
+        Ok(devices) => devices.map(|d| d.to_string()).collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to enumerate input devices");
+            Vec::new()
+        }
+    }
+}
+
+/// Whether an input device with this display name exists right now.
+///
+/// Public because the caller wants to warn *before* acting: meeting mode asks
+/// for an Aggregate Device so it can hear both sides of a call, and capture
+/// silently falls back to the bare mic when it is missing — which still records,
+/// but only the user's half, and a one-sided transcript looks exactly like a
+/// working one.
+pub fn input_device_exists(name: &str) -> bool {
+    list_input_devices().iter().any(|d| d == name)
+}
 
 /// Start microphone capture on a dedicated OS thread.
 ///
@@ -81,10 +116,10 @@ const DEFAULT_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 /// permission is resolved. Doing this on its own thread keeps that latency (and
 /// any permission stall) off the server's startup path — `/health` and `/ws`
 /// come up immediately regardless of mic state.
-pub fn spawn_capture(target_rate: u32, device_name: Option<String>, tx: Sender<Vec<f32>>) {
+pub fn spawn_capture(target_rate: u32, request: DeviceRequest, tx: Sender<Vec<f32>>) {
     std::thread::Builder::new()
         .name("audio-capture".into())
-        .spawn(move || capture_loop(target_rate, device_name, tx))
+        .spawn(move || capture_loop(target_rate, request, tx))
         .expect("failed to spawn audio-capture thread");
 }
 
@@ -104,23 +139,27 @@ pub fn spawn_capture(target_rate: u32, device_name: Option<String>, tx: Sender<V
 /// reports. That second part matters on its own — `StreamInvalidated` fires when
 /// a device changes sample rate underneath us, and the old ratio would resample
 /// every buffer wrong.
-fn capture_loop(target_rate: u32, device_name: Option<String>, tx: Sender<Vec<f32>>) {
+///
+/// The same loop serves runtime device switching: `request` is re-read on every
+/// rebuild, so pointing it at another device is enough to move capture there.
+fn capture_loop(target_rate: u32, request: DeviceRequest, tx: Sender<Vec<f32>>) {
     let mut failures: u64 = 0;
     loop {
         // Capacity 1: one signal is all a rebuild needs, and a full channel
         // means one is already pending.
         let (lost_tx, lost_rx) = crossbeam_channel::bounded::<()>(1);
-        match open_stream(target_rate, device_name.as_deref(), tx.clone(), lost_tx) {
+        let requested = requested_name(&request);
+        match open_stream(target_rate, requested.as_deref(), tx.clone(), lost_tx) {
             Ok((stream, opened)) => {
                 failures = 0;
                 tracing::info!(device = %opened, "microphone capture running");
                 // Block here for the life of the stream. Callbacks fire on
                 // CoreAudio's own thread meanwhile and `stream` must stay alive
                 // for them.
-                match wait_for_rebuild(&lost_rx, device_name.as_deref(), &opened) {
+                match wait_for_rebuild(&lost_rx, &request, &opened) {
                     Rebuild::DeviceLost => tracing::warn!("input device lost; reopening"),
-                    Rebuild::DefaultChanged(to) => {
-                        tracing::info!(from = %opened, %to, "system default input changed; reopening")
+                    Rebuild::Moved(to) => {
+                        tracing::info!(from = %opened, %to, "capture device changed; reopening")
                     }
                 }
                 drop(stream);
@@ -146,37 +185,49 @@ fn capture_loop(target_rate: u32, device_name: Option<String>, tx: Sender<Vec<f3
 enum Rebuild {
     /// The stream is dead: a fatal error, or it dropped its sender.
     DeviceLost,
-    /// The stream is healthy but the system default input moved elsewhere.
-    DefaultChanged(String),
+    /// The stream is healthy but capture belongs on a different device now.
+    Moved(String),
 }
 
 /// Block until something warrants rebuilding the stream.
 ///
 /// Two reasons, and the second is why this polls instead of just blocking on the
-/// channel: a default-device change leaves our stream perfectly healthy, so cpal
-/// reports nothing at all. Without the poll we would keep capturing the old
-/// device forever — audio, from the wrong microphone, with no error and no log
-/// line to say so. That is the same failure shape as the disconnect this
-/// function also handles, just quieter.
-///
-/// A **named** device never follows the default: meeting mode pins an Aggregate
-/// Device by name and must not drift off it.
-fn wait_for_rebuild(lost_rx: &Receiver<()>, device_name: Option<&str>, opened: &str) -> Rebuild {
-    if device_name.is_some() {
-        let _ = lost_rx.recv();
-        return Rebuild::DeviceLost;
-    }
+/// channel: neither a default-device change nor a new [`DeviceRequest`] disturbs
+/// the open stream at all, so cpal reports nothing. Without the poll we would
+/// keep capturing the old device forever — audio, from the wrong microphone,
+/// with no error and no log line to say so. Same failure shape as the disconnect
+/// this function also handles, just quieter.
+fn wait_for_rebuild(lost_rx: &Receiver<()>, request: &DeviceRequest, opened: &str) -> Rebuild {
     loop {
-        match lost_rx.recv_timeout(DEFAULT_POLL) {
+        match lost_rx.recv_timeout(DEVICE_POLL) {
             // Disconnected means the stream dropped its sender — also a rebuild.
             Ok(()) | Err(RecvTimeoutError::Disconnected) => return Rebuild::DeviceLost,
             Err(RecvTimeoutError::Timeout) => {
-                let current = default_input_name();
-                if should_follow_default(device_name, opened, current.as_deref()) {
-                    return Rebuild::DefaultChanged(current.unwrap_or_default());
+                let desired = desired_name(request);
+                if should_reopen(desired.as_deref(), opened) {
+                    return Rebuild::Moved(desired.unwrap_or_default());
                 }
             }
         }
+    }
+}
+
+fn requested_name(request: &DeviceRequest) -> Option<String> {
+    request.lock().unwrap().clone()
+}
+
+/// The device capture should be on right now.
+///
+/// A request for a device that is not currently present resolves to the system
+/// default — the same fallback [`open_stream`] performs. That keeps the poll
+/// comparing against what is actually attainable: otherwise a request for an
+/// absent Aggregate Device would differ from the fallback we opened on *every*
+/// poll and rebuild the stream forever. It also self-heals, since the device
+/// gets picked up on the first poll after it appears.
+fn desired_name(request: &DeviceRequest) -> Option<String> {
+    match requested_name(request) {
+        Some(name) if input_device_exists(&name) => Some(name),
+        _ => default_input_name(),
     }
 }
 
@@ -186,13 +237,13 @@ fn default_input_name() -> Option<String> {
     cpal::default_host().default_input_device().map(|d| d.to_string())
 }
 
-/// Whether an open stream should be torn down and reopened on a different device.
+/// Whether an open stream should be torn down and reopened elsewhere.
 ///
-/// `current` of `None` means the system reports no input device at all. There is
-/// nothing better to move to, so keep whatever is still working rather than
-/// rebuilding into a retry loop.
-fn should_follow_default(device_name: Option<&str>, opened: &str, current: Option<&str>) -> bool {
-    device_name.is_none() && matches!(current, Some(c) if c != opened)
+/// `desired` of `None` means there is nothing to move to — no request, and the
+/// system reports no default input either. Keep whatever is still working rather
+/// than rebuilding into a retry loop.
+fn should_reopen(desired: Option<&str>, opened: &str) -> bool {
+    matches!(desired, Some(d) if d != opened)
 }
 
 /// Whether a stream error means the stream is dead and must be rebuilt.
@@ -219,6 +270,10 @@ fn open_stream(
     lost_tx: Sender<()>,
 ) -> Result<(Stream, String)> {
     let host = cpal::default_host();
+    let default = || {
+        host.default_input_device()
+            .ok_or_else(|| anyhow!("no default input device (microphone) found"))
+    };
     let device = match device_name {
         Some(name) => {
             let mut found = None;
@@ -229,11 +284,23 @@ fn open_stream(
                     break;
                 }
             }
-            found.ok_or_else(|| anyhow!("input device not found: {name}"))?
+            match found {
+                Some(d) => d,
+                None => {
+                    // Fall back rather than fail: erroring here would retry the
+                    // same missing device once a second forever and capture
+                    // nothing at all, which is strictly worse than the bare mic.
+                    // Loud because a one-sided meeting transcript looks exactly
+                    // like a working one — see `input_device_exists`.
+                    tracing::warn!(
+                        device = name,
+                        "requested input device not found; falling back to the system default"
+                    );
+                    default()?
+                }
+            }
         }
-        None => host
-            .default_input_device()
-            .ok_or_else(|| anyhow!("no default input device (microphone) found"))?,
+        None => default()?,
     };
     // Record what we actually opened, so a later default-device change can be
     // recognized as a change rather than compared against the request.
@@ -330,7 +397,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{is_fatal, should_follow_default, LinearResampler};
+    use super::{is_fatal, should_reopen, LinearResampler};
     use cpal::ErrorKind;
 
     /// The rebuild trigger. `DeviceNotAvailable` is what a disconnecting
@@ -368,21 +435,19 @@ mod tests {
         }
     }
 
-    /// Following the system default. A named device must never follow — meeting
-    /// mode pins an Aggregate Device and drifting off it would silently capture
-    /// one side of the call.
+    /// When to move capture to another device. `desired` has already collapsed
+    /// "explicit request" and "system default" into one answer, so this is the
+    /// whole decision — and the `None` case is the one that matters: nothing to
+    /// move to must mean stay put, or a machine with no default input rebuilds
+    /// the stream every poll forever.
     #[test]
-    fn only_an_unnamed_capture_follows_the_default_input() {
-        assert!(should_follow_default(None, "AirPods Pro", Some("MacBook Air Microphone")));
+    fn capture_reopens_only_when_it_is_on_the_wrong_device() {
+        // Default drifted away, or a meeting pinned an Aggregate Device.
+        assert!(should_reopen(Some("MacBook Air Microphone"), "AirPods Pro"));
+        assert!(should_reopen(Some("Matalu Aggregate"), "MacBook Air Microphone"));
 
-        assert!(!should_follow_default(None, "AirPods Pro", Some("AirPods Pro")));
-        // No default at all: nothing better to move to, so keep what works.
-        assert!(!should_follow_default(None, "AirPods Pro", None));
-        assert!(!should_follow_default(
-            Some("Aggregate Device"),
-            "Aggregate Device",
-            Some("AirPods Pro")
-        ));
+        assert!(!should_reopen(Some("AirPods Pro"), "AirPods Pro"));
+        assert!(!should_reopen(None, "AirPods Pro"));
     }
 
     /// 3:1 downsample of N input frames yields ~N/3 output frames.

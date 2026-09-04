@@ -25,6 +25,7 @@ pub fn set_settings(
 ) -> Result<(), String> {
     session.set_mode(settings.activation_mode.into());
     session.set_cleanup(settings.cleanup);
+    session.set_meeting_device(Some(settings.meeting_device.clone()));
 
     // Clear any existing plugin hotkey, then (re)register unless the new preset
     // is Fn. Fn is a CGEventTap started at launch; switching *to* Fn just drops
@@ -39,6 +40,14 @@ pub fn set_settings(
 
     settings::save(&app, &settings).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Input devices available right now, for the meeting-device picker. A name
+/// typed by hand is a silent-failure trap: capture falls back to the bare mic
+/// and the meeting transcribes one side of the call looking perfectly healthy.
+#[tauri::command]
+pub fn list_input_devices() -> Vec<String> {
+    matalu::audio::list_input_devices()
 }
 
 #[derive(Serialize)]
