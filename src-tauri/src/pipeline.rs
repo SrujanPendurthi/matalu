@@ -262,6 +262,7 @@ fn spawn_audio_gate(
             let mut prev = gate::NONE;
             let mut real_samples: u64 = 0;
             let mut peak: f32 = 0.0;
+            let mut dropped: u64 = 0;
             while let Ok(buf) = capture_rx.recv() {
                 let mode = gate_mode.load(Ordering::Relaxed);
                 if mode != prev {
@@ -277,7 +278,7 @@ fn spawn_audio_gate(
                             // the user's last words, so it goes through as real
                             // audio ahead of the burst.
                             recorder.write(&buf);
-                            let _ = sidecar_tx.try_send(buf);
+                            forward_to_sidecar(&sidecar_tx, buf, &mut dropped);
                             burst_drain_silence(&capture_rx, &sidecar_tx, &recorder, silence_ms);
                             prev = mode;
                             continue;
@@ -309,7 +310,7 @@ fn spawn_audio_gate(
                     gate::SILENCE => vec![0.0f32; buf.len()],
                     _ => continue, // NONE: drop, feed nothing
                 };
-                let _ = sidecar_tx.try_send(out);
+                forward_to_sidecar(&sidecar_tx, out, &mut dropped);
             }
             tracing::info!("audio gate: capture channel closed");
         })
@@ -322,6 +323,35 @@ fn spawn_audio_gate(
 fn drain_burst_samples(silence_ms: u64) -> usize {
     let steps = silence_ms.div_ceil(SIDECAR_STEP_MS) + 1;
     (steps * SIDECAR_STEP_MS * TARGET_SAMPLE_RATE as u64 / 1000) as usize
+}
+
+/// Forward one buffer to the sidecar, counting buffers the queue could not take.
+///
+/// `try_send`, never `send`: the gate must not block, so a full queue drops the
+/// buffer rather than stalling capture behind it. What it must *not* do is drop
+/// it silently — in meeting mode the gate is the only path to the transcript,
+/// so a discarded buffer is speech that never reaches the model while the
+/// meeting WAV keeps it (`MeetingRecorder::write` runs first). The transcript
+/// would just be missing words, with nothing to say so.
+///
+/// Measured 2026-09-04: this never fires on this hardware. `finalize()` runs at
+/// ~28x realtime (431 ms for a 12 s utterance, the `MATALU_MAX_UTTERANCE_MS`
+/// cap), so the sidecar stays ~0.5 s *ahead* of a realtime feed and the 64-slot
+/// queue plus the 64 KB stdin pipe (1.02 s @16 kHz) is never approached. The
+/// counter exists because that margin is hardware- and model-dependent and
+/// nothing else would report it shrinking. Same idiom as the other lossy hop,
+/// `matalu::audio`'s capture callback.
+fn forward_to_sidecar(
+    sidecar_tx: &crossbeam_channel::Sender<Vec<f32>>,
+    buf: Vec<f32>,
+    dropped: &mut u64,
+) {
+    if sidecar_tx.try_send(buf).is_err() {
+        *dropped += 1;
+        if *dropped % 100 == 1 {
+            tracing::warn!(dropped = *dropped, "sidecar behind; dropping audio buffers");
+        }
+    }
 }
 
 /// Push the whole drain silence at once instead of pacing it at mic cadence.
@@ -527,5 +557,22 @@ mod tests {
         let (side_tx, side_rx) = crossbeam_channel::bounded::<Vec<f32>>(1);
         burst_drain_silence(&cap_rx, &side_tx, &MeetingRecorder::new(), 700);
         assert_eq!(side_rx.len(), 1, "should have stopped at the queue limit");
+    }
+
+    /// The counter is the only evidence a dropped buffer leaves, so it has to
+    /// survive refactors of the gate. Without it a full queue is silent and a
+    /// meeting transcript just quietly loses words.
+    #[test]
+    fn dropped_buffers_are_counted_not_silent() {
+        let (side_tx, _side_rx) = crossbeam_channel::bounded::<Vec<f32>>(1);
+        let mut dropped = 0u64;
+
+        forward_to_sidecar(&side_tx, vec![0.1f32; 10], &mut dropped);
+        assert_eq!(dropped, 0, "a buffer that fits must not count as dropped");
+
+        for _ in 0..5 {
+            forward_to_sidecar(&side_tx, vec![0.1f32; 10], &mut dropped);
+        }
+        assert_eq!(dropped, 5, "every buffer past capacity must be counted");
     }
 }
