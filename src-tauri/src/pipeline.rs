@@ -197,7 +197,10 @@ pub fn start(app: AppHandle, mode: Mode, cleanup: bool) -> anyhow::Result<Starte
     // capture --(gate)--> sidecar. Both legs bounded + lossy (drop, never block).
     let (capture_tx, capture_rx) = crossbeam_channel::bounded::<Vec<f32>>(64);
     let (sidecar_tx, sidecar_rx) = crossbeam_channel::bounded::<Vec<f32>>(64);
-    spawn_audio_gate(capture_rx, sidecar_tx, gate_mode, recorder, silence_ms);
+    // The gate runs for the life of the app. Its drop counter is diagnostic —
+    // asserted on in the tests below, and the only evidence a drop leaves.
+    let (_gate_drops, _gate) =
+        spawn_audio_gate(capture_rx, sidecar_tx, gate_mode, recorder, silence_ms);
 
     let sc = sidecar::spawn(cfg, sidecar_rx, events_tx)?;
     let sidecar_ready = sc.ready;
@@ -255,14 +258,15 @@ fn spawn_audio_gate(
     gate_mode: Arc<AtomicU8>,
     recorder: Arc<MeetingRecorder>,
     silence_ms: u64,
-) {
-    std::thread::Builder::new()
+) -> (Arc<AtomicU64>, std::thread::JoinHandle<()>) {
+    let dropped = Arc::new(AtomicU64::new(0));
+    let dropped_thread = Arc::clone(&dropped);
+    let handle = std::thread::Builder::new()
         .name("audio-gate".into())
         .spawn(move || {
             let mut prev = gate::NONE;
             let mut real_samples: u64 = 0;
             let mut peak: f32 = 0.0;
-            let mut dropped: u64 = 0;
             while let Ok(buf) = capture_rx.recv() {
                 let mode = gate_mode.load(Ordering::Relaxed);
                 if mode != prev {
@@ -278,7 +282,7 @@ fn spawn_audio_gate(
                             // the user's last words, so it goes through as real
                             // audio ahead of the burst.
                             recorder.write(&buf);
-                            forward_to_sidecar(&sidecar_tx, buf, &mut dropped);
+                            forward_to_sidecar(&sidecar_tx, buf, &dropped_thread);
                             burst_drain_silence(&capture_rx, &sidecar_tx, &recorder, silence_ms);
                             prev = mode;
                             continue;
@@ -310,11 +314,12 @@ fn spawn_audio_gate(
                     gate::SILENCE => vec![0.0f32; buf.len()],
                     _ => continue, // NONE: drop, feed nothing
                 };
-                forward_to_sidecar(&sidecar_tx, out, &mut dropped);
+                forward_to_sidecar(&sidecar_tx, out, &dropped_thread);
             }
             tracing::info!("audio gate: capture channel closed");
         })
         .expect("spawn audio-gate thread");
+    (dropped, handle)
 }
 
 /// Number of zero samples to burst so the sidecar's VAD crosses `SILENCE_MS`.
@@ -344,12 +349,12 @@ fn drain_burst_samples(silence_ms: u64) -> usize {
 fn forward_to_sidecar(
     sidecar_tx: &crossbeam_channel::Sender<Vec<f32>>,
     buf: Vec<f32>,
-    dropped: &mut u64,
+    dropped: &AtomicU64,
 ) {
     if sidecar_tx.try_send(buf).is_err() {
-        *dropped += 1;
-        if *dropped % 100 == 1 {
-            tracing::warn!(dropped = *dropped, "sidecar behind; dropping audio buffers");
+        let n = dropped.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 100 == 1 {
+            tracing::warn!(dropped = n, "sidecar behind; dropping audio buffers");
         }
     }
 }
@@ -559,20 +564,47 @@ mod tests {
         assert_eq!(side_rx.len(), 1, "should have stopped at the queue limit");
     }
 
-    /// The counter is the only evidence a dropped buffer leaves, so it has to
-    /// survive refactors of the gate. Without it a full queue is silent and a
-    /// meeting transcript just quietly loses words.
     #[test]
     fn dropped_buffers_are_counted_not_silent() {
         let (side_tx, _side_rx) = crossbeam_channel::bounded::<Vec<f32>>(1);
-        let mut dropped = 0u64;
+        let dropped = AtomicU64::new(0);
 
-        forward_to_sidecar(&side_tx, vec![0.1f32; 10], &mut dropped);
-        assert_eq!(dropped, 0, "a buffer that fits must not count as dropped");
+        forward_to_sidecar(&side_tx, vec![0.1f32; 10], &dropped);
+        assert_eq!(dropped.load(Ordering::Relaxed), 0, "a buffer that fits is not a drop");
 
         for _ in 0..5 {
-            forward_to_sidecar(&side_tx, vec![0.1f32; 10], &mut dropped);
+            forward_to_sidecar(&side_tx, vec![0.1f32; 10], &dropped);
         }
-        assert_eq!(dropped, 5, "every buffer past capacity must be counted");
+        assert_eq!(dropped.load(Ordering::Relaxed), 5, "every buffer past capacity counts");
+    }
+
+    /// The counter is the only evidence a dropped buffer leaves, so the *gate*
+    /// has to keep routing through it — a unit test on `forward_to_sidecar`
+    /// alone would still pass if the gate went back to a bare `let _ =
+    /// try_send`. Drives the real thread and asserts on what it counted.
+    #[test]
+    fn gate_counts_buffers_the_sidecar_queue_rejects() {
+        let (cap_tx, cap_rx) = crossbeam_channel::bounded::<Vec<f32>>(64);
+        let (side_tx, _side_rx) = crossbeam_channel::bounded::<Vec<f32>>(2);
+        let (dropped, gate) = spawn_audio_gate(
+            cap_rx,
+            side_tx,
+            Arc::new(AtomicU8::new(gate::REAL)),
+            MeetingRecorder::new(),
+            700,
+        );
+
+        // Nothing drains `_side_rx`, so the queue takes 2 and rejects the rest.
+        for _ in 0..12 {
+            cap_tx.send(vec![0.5f32; 10]).unwrap();
+        }
+        drop(cap_tx); // closing capture ends the gate loop, so join is deterministic
+        gate.join().expect("gate thread panicked");
+
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            10,
+            "12 buffers into a queue of 2 must count 10 drops"
+        );
     }
 }
